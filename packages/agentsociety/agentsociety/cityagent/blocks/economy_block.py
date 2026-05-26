@@ -112,7 +112,7 @@ class WorkBlock(Block):
         result = clean_json_response(result)
         try:
             result: Any = json_repair.loads(result)
-            time = result["time"]
+            time = int(result["time"])
             day, start_time = self.environment.get_datetime(format_time=True)
             await self.memory.status.update(
                 "working_experience",

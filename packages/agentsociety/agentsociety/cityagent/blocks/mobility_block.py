@@ -260,6 +260,13 @@ class PlaceSelectionBlock(Block):
             next_place = (pois[selected][0], pois[selected][1])
         else:  # Fallback random selection
             all_pois = self.environment.map.get_all_pois()
+            if not all_pois:
+                return {
+                    "success": False,
+                    "evaluation": "No POIs available in map for fallback selection",
+                    "consumed_time": random.randint(1, 30),
+                    "node_id": None,
+                }
             next_place = random.choice(all_pois)
             next_place = (next_place["name"], next_place["id"])
 
@@ -427,11 +434,16 @@ class MoveBlock(Block):
                 )
             else:
                 aois = self.environment.map.get_all_aois()
-                while True:
-                    r_aoi = random.choice(aois)
-                    if len(r_aoi["poi_ids"]) > 0:
-                        r_poi = random.choice(r_aoi["poi_ids"])
-                        break
+                aois_with_pois = [a for a in aois if len(a["poi_ids"]) > 0]
+                if not aois_with_pois:
+                    return {
+                        "success": False,
+                        "evaluation": "No AOIs with POIs available in map",
+                        "consumed_time": random.randint(1, 30),
+                        "node_id": node_id,
+                    }
+                r_aoi = random.choice(aois_with_pois)
+                r_poi = random.choice(r_aoi["poi_ids"])
                 poi = self.environment.map.get_poi(r_poi)
                 next_place = (poi["name"], poi["aoi_id"])
                 await self.environment.set_aoi_schedules(

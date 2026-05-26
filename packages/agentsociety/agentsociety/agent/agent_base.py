@@ -7,6 +7,7 @@ from typing import Any, Optional, Union
 from pycityproto.city.person.v2 import person_pb2 as person_pb2
 from pydantic import BaseModel
 
+from ..llm import current_agent_id
 from ..logger import get_logger
 from ..memory import Memory
 from ..message import Message, MessageKind
@@ -449,6 +450,7 @@ class Agent(ABC):
             - It calls the `forward` method to execute the agent's behavior logic.
             - Acts as the main control flow for the agent, coordinating when and how the agent performs its actions.
         """
+        current_agent_id.set(self.id)
         start_time = time.time()
         # run required methods before agent forward
         await self.before_forward()

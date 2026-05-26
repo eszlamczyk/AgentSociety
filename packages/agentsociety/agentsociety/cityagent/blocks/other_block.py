@@ -90,7 +90,7 @@ class SleepBlock(Block):
             return {
                 "success": True,
                 "evaluation": f'Sleep: {context["current_step"]["intention"]}',
-                "consumed_time": result["time"],
+                "consumed_time": int(result["time"]),
                 "node_id": node_id,
             }
         except Exception as e:
@@ -139,10 +139,11 @@ class OtherNoneBlock(Block):
         )
         try:
             result: Any = json_repair.loads(result)
+            consumed_time = int(result["time"])
             return {
                 "success": True,
                 "evaluation": f'Finished executing {context["current_step"]["intention"]}',
-                "consumed_time": result["time"],
+                "consumed_time": consumed_time,
                 "node_id": node_id,
             }
         except Exception as e:
@@ -247,5 +248,10 @@ class OtherBlock(Block):
 
         consumption_end = self.llm.prompt_tokens_used + self.llm.completion_tokens_used
         self.token_consumption += consumption_end - consumption_start
+
+        try:
+            result["consumed_time"] = int(result["consumed_time"])
+        except (ValueError, TypeError, KeyError):
+            result["consumed_time"] = random.randint(1, 30)
 
         return self.OutputType(**result)

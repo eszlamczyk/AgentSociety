@@ -2,6 +2,7 @@ import asyncio
 import os
 import random
 import time
+from contextvars import ContextVar
 from enum import Enum
 from multiprocessing import cpu_count
 from typing import Any, List, Optional, Union, overload
@@ -20,6 +21,10 @@ from pydantic import BaseModel, Field, field_serializer, model_validator
 from ..logger import get_logger
 
 os.environ["GRPC_VERBOSITY"] = "ERROR"
+
+# Tracks which agent is currently making an LLM call.
+# Set at the start of each agent's run(); read inside LLMActor.call() to tag logs.
+current_agent_id: ContextVar[int | None] = ContextVar("current_agent_id", default=None)
 
 __all__ = [
     "LLM",
@@ -42,6 +47,7 @@ class LLMProviderType(str, Enum):
         - `ZHIPU`: Zhipu.
         - `SILICONFLOW`: SiliconFlow.
         - `VLLM`: VLLM.
+        - `PLGRID`: Plgrid forge LLMs
     """
 
     OpenAI = "openai"
@@ -51,6 +57,7 @@ class LLMProviderType(str, Enum):
     SiliconFlow = "siliconflow"
     VolcEngine = "volcengine"
     VLLM = "vllm"
+    PLGrid = "plgrid"
 
 
 class LLMConfig(BaseModel):
@@ -113,13 +120,14 @@ class LLMActor:
         ] = NOT_GIVEN,
         temperature: float = 1,
         max_tokens: Optional[int] = None,
-        top_p: Optional[float] = None,
-        frequency_penalty: Optional[float] = None,
-        presence_penalty: Optional[float] = None,
+        top_p: Union[float, NotGiven] = NOT_GIVEN,
+        frequency_penalty: Union[float, NotGiven] = NOT_GIVEN,
+        presence_penalty: Union[float, NotGiven] = NOT_GIVEN,
         timeout: int = 300,
         retries: int = 10,
         tools: Union[List[ChatCompletionToolParam], NotGiven] = NOT_GIVEN,
         tool_choice: Union[ChatCompletionToolChoiceOptionParam, NotGiven] = NOT_GIVEN,
+        agent_id: Optional[int] = None,
     ):
         """
         Sends an asynchronous text request to the configured LLM API.
@@ -150,6 +158,7 @@ class LLMActor:
 
         log = {
             "request_time": start_time,
+            "agent_id": agent_id,
             "total_errors": 0,
             "error_types": {
                 "connection_error": 0,
@@ -294,6 +303,8 @@ class LLM:
                 base_url = "https://open.bigmodel.cn/api/paas/v4/"
             elif config.provider == LLMProviderType.VolcEngine:
                 base_url = "https://ark.cn-beijing.volces.com/api/v3/"
+            elif config.provider == LLMProviderType.PLGrid:
+                base_url = "https://llmlab.plgrid.pl/api/v1"
             else:
                 raise ValueError(f"Unsupported `provider` {config.provider}!")
             config.base_url = base_url
@@ -320,9 +331,9 @@ class LLM:
         ] = NOT_GIVEN,
         temperature: float = 1,
         max_tokens: Optional[int] = None,
-        top_p: Optional[float] = None,
-        frequency_penalty: Optional[float] = None,
-        presence_penalty: Optional[float] = None,
+        top_p: Union[float, NotGiven] = NOT_GIVEN,
+        frequency_penalty: Union[float, NotGiven] = NOT_GIVEN,
+        presence_penalty: Union[float, NotGiven] = NOT_GIVEN,
         timeout: int = 300,
         retries: int = 10,
         tools: NotGiven = NOT_GIVEN,
@@ -338,9 +349,9 @@ class LLM:
         ] = NOT_GIVEN,
         temperature: float = 1,
         max_tokens: Optional[int] = None,
-        top_p: Optional[float] = None,
-        frequency_penalty: Optional[float] = None,
-        presence_penalty: Optional[float] = None,
+        top_p: Union[float, NotGiven] = NOT_GIVEN,
+        frequency_penalty: Union[float, NotGiven] = NOT_GIVEN,
+        presence_penalty: Union[float, NotGiven] = NOT_GIVEN,
         timeout: int = 300,
         retries: int = 10,
         tools: List[ChatCompletionToolParam] = [],
@@ -355,9 +366,9 @@ class LLM:
         ] = NOT_GIVEN,
         temperature: float = 1,
         max_tokens: Optional[int] = None,
-        top_p: Optional[float] = None,
-        frequency_penalty: Optional[float] = None,
-        presence_penalty: Optional[float] = None,
+        top_p: Union[float, NotGiven] = NOT_GIVEN,
+        frequency_penalty: Union[float, NotGiven] = NOT_GIVEN,
+        presence_penalty: Union[float, NotGiven] = NOT_GIVEN,
         timeout: int = 300,
         retries: int = 10,
         tools: Union[List[ChatCompletionToolParam], NotGiven] = NOT_GIVEN,
@@ -409,6 +420,7 @@ class LLM:
                 retries,
                 tools,
                 tool_choice,
+                current_agent_id.get(),
             )
             self._log_list.append(log)
             self.prompt_tokens_used += log["input_tokens"]
