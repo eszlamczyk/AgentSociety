@@ -22,8 +22,8 @@ ANTENNA_RANGE = 5000.0
 GLOBAL_INTERNET_LOG_FILE = "all_internet_activity_logs.jsonl"
 GLOBAL_DEVICE_CONNECTION_LOG_FILE = "antenna_device_connections.jsonl"
 GLOBAL_DEVICE_USAGE_LOG_FILE = "device_usage_logs.jsonl"
-GLOBAL_LOG_DIR = "internet_logs"
-POSITION_LOG_DIR = "position_logs"
+GLOBAL_LOG_DIR = os.environ.get("INTERNET_LOG_DIR", "internet_logs")
+POSITION_LOG_DIR = os.environ.get("POSITION_LOG_DIR", "position_logs")
 
 # Ensure the log directories exist
 os.makedirs(GLOBAL_LOG_DIR, exist_ok=True)

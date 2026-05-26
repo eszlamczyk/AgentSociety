@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import copy
+import time
 
 import agentsociety.vectorstore.vectorstore as _vs
 _vs_source = inspect.getsourcefile(_vs.VectorStore)
@@ -32,15 +33,17 @@ from agentsociety.simulation import AgentSociety
 from agentsociety.storage import DatabaseConfig
 from internetagent import InternetAgent, START_WEEKDAY
 from internet_memory_config import memory_config_internetagent
+from metrics.collect import MetricsCollector
 
 config = Config(
     llm=[
         LLMConfig(
-            provider=LLMProviderType.ZhipuAI,
-            base_url=None,
-            api_key="bc2e3cb9022b4d38b5f144b166d1ac11.oKkJEOu2i4TYw69z",
-            model="GLM-4-Flash",
-            semaphore=200,
+            provider=LLMProviderType.PLGrid,
+            base_url = None,
+            api_key="plg-yx0k9waUqMpUwK2v8J_cO1AzJTuySv9Okgf75-8sa7U",
+            model="speakleash/Bielik-11B-v3.0-Instruct",
+            concurrency=2000,
+            timeout = 60
         )
     ],
     env=EnvConfig(
@@ -57,8 +60,8 @@ config = Config(
         citizens=[
             AgentConfig(
                 agent_class=InternetAgent,
-                number=100,
-                memory_config_func=memory_config_internetagent,  # Use custom memory config with ICT device fields
+                number=2000,
+                memory_config_func=memory_config_internetagent,
                 memory_distributions=copy.deepcopy(DEFAULT_DISTRIBUTIONS),
                 blocks={
                     MobilityBlock: MobilityBlockParams(),
@@ -70,29 +73,54 @@ config = Config(
         ]
     ),  # type: ignore
     exp=ExpConfig(
-        name="internet 11.12 device test",
+        name="internet 2000 agents 1hr throughput test",
         workflow=[
             WorkflowStepConfig(
-                type=WorkflowType.RUN,
+                type=WorkflowType.STEP,
                 days=1,
+                steps=12,
+                ticks_per_step=5 * 60
             ),
         ],
         environment=EnvironmentConfig(
             start_tick=6 * 60 * 60,    # Start at 06:00 AM
-            total_tick=18 * 60 * 60,   # Run for 18 hours (until midnight)
         ),
     ),
+    logging_level="info"
 )
 config = default(config)
 
 
+TICKS_PER_STEP = 5 * 60   # 5 minutes of sim time per step
+N_STEPS = 12               # 12 * 5min = 1hr
+
+
 async def main():
-    agentsociety = AgentSociety.create(config)
+    engine = AgentSociety.create(config)
+    metrics = None
     try:
-        await agentsociety.init()
-        await agentsociety.run()
+        await engine.init()
+
+        all_pois = engine.environment.map.get_all_pois()
+        all_aois = engine.environment.map.get_all_aois()
+        aois_with_pois = [a for a in all_aois if len(a["poi_ids"]) > 0]
+        print(f"[map] POIs: {len(all_pois)}, AOIs: {len(all_aois)}, AOIs with POIs: {len(aois_with_pois)}")
+
+        metrics = MetricsCollector(out_dir="metrics/output/2000agent_throughput_test")
+
+        for step in range(N_STEPS):
+            day, tick = engine.environment.get_datetime()
+            t0 = time.perf_counter()
+            logs = await engine.step(TICKS_PER_STEP)
+            wall = time.perf_counter() - t0
+
+            metrics.record(tick=tick, wall_time_s=wall, llm_log=logs.llm_log)
+            print(f"[step {step+1}/{N_STEPS}] tick={tick} wall={wall:.1f}s")
+
     finally:
-        await agentsociety.close()
+        if metrics is not None:
+            metrics.close()
+        await engine.close()
 
 
 if __name__ == "__main__":
