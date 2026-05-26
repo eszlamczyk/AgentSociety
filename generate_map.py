@@ -1,7 +1,7 @@
 import os
 os.environ["OVERPASS_URL"] = "https://overpass.kumi.systems/api/interpreter"
 
-from mosstool.map.osm import RoadNet, Building
+from mosstool.map.osm import RoadNet, Building, PointOfInterest
 from mosstool.map.builder import Builder
 from mosstool.util.format_converter import dict2pb
 from mosstool.type import Map
@@ -36,10 +36,20 @@ if __name__ == "__main__":
     )
     aois = building.create_building("cache/aois.geojson")
 
+    print("Fetching POIs from OSM...")
+    poi = PointOfInterest(
+        max_latitude=max_lat,
+        min_latitude=min_lat,
+        max_longitude=max_lon,
+        min_longitude=min_lon,
+    )
+    pois = poi.create_pois("cache/pois.geojson")
+
     print("Building map...")
     builder = Builder(
         net=roadnet,
         aois=aois,
+        pois=pois,
         proj_str=projstr,
     )
     m = builder.build("beijing")
