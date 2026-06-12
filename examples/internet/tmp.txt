@@ -1,0 +1,99 @@
+Stress testy:
+Sprawdzić sensowność danych:
+[DONE] Wykres ile agentów co robi o której godzinie
+  -> run_logs/100agent_fullday/plots/activity_by_hour.png
+
+[DONE] odpalić dużo agentów per godzine
+  -> metrics/output/1000agent_ratelimit_test/, 2000agent_throughput_test/
+
+[DONE] Sprawdzić czy się poruszają/kiedy się poruszają
+  -> run_logs/100agent_fullday/plots/movement_by_hour.png
+  -> run_logs/100agent_fullday/plots/mobility_by_hour.png
+
+[DONE] Cała doba (od 6 do 6) 100 agentów, z tego liczyć metryki itd
+  -> run_logs/100agent_fullday/, metrics/output/100agent_fullday/
+
+[DONE] Sprawdzić rate limity (dużo agentów w małej ilości czasu)
+  -> metrics/output/1000agent_ratelimit_test/
+
+
+--- WYNIKI / GDZIE SĄ PLOTY ---
+
+PREZENTACYJNE:
+metrics/output/comparison_plots/
+  01_wall_time_total.png       - czy czas rośnie wraz z liczbą agentów?
+  02_wall_time_per_agent.png   - czy każdy agent jest tańszy przy skali? (tak, sublinear O(N^0.58))
+  03_tokens_per_agent.png      - czy zachowanie agentów jest spójne niezależnie od skali?
+  04_tokens_per_second.png     - realny throughput PLGrid (~6k tok/s sufit)
+
+run_logs/100agent_fullday/plots/
+  activity_by_hour.png         - co robią agenci i kiedy? (browse/work/shop/social per godzina)
+  movement_by_hour.png         - kiedy się poruszają? (okno 6-9 rano, poranny dojazd)
+
+SZCZEGÓŁOWE (per run, raczej nie do prezentacji):
+metrics/output/{1agent,10agent1Hour,100agent1Hour,1000agent_ratelimit_test}/plots/
+  01_wall_time_per_step.png    - czas kroku dla danego runu
+  06_tokens_per_second.png     - throughput PLGrid w czasie
+  07_tokens_per_agent_per_step.png - tokeny per agent w czasie
+  08_agent_input_vs_output.png - podział input/output per agent
+
+
+## ========= 2 ===================
+
+
+trzymać te sposoby liczenia metryk
+[DONE] co to jest za ruch (internet)
+  -> run_logs/100agent_fullday/plots/top_websites_per_type.png
+  -> run_logs/100agent_fullday/plots/traffic_per_agent.png
+[DONE] co to jest za ruch (mobilnosc w przestrzeni)
+  -> run_logs/100agent_fullday/plots/mobility_trajectories.png
+  -> run_logs/100agent_fullday/plots/mobility_plan_targets.png
+  -> run_logs/100agent_fullday/plots/mobility_distance_dist.png
+- zeby bylo ich wiecej
+[DONE] jakosc narysowac ile adresow IP dany agent mial
+  -> run_logs/100agent_fullday/plots/ip_per_agent.png
+[DONE] popatrzyc na te prompty co tam sie dzieje (czesciowo - opisy akcji)
+  -> run_logs/100agent_fullday/plots/action_description_keywords.png
+  (pelne logi LLM nie sa zbierane - wymaga zmian w kodzie)
+- podrasowac movement i prompting (long term)
+
+- moze sprobowac pakowac prompty - uwazac na context pollution (long term)
+
+## znowu runy 24h
+[DONE] sprawdzic czy inne modele maja lepszy throughput
+  -> run_logs/100agent_fullday_better_model/ (Qwen3-Coder-30B)
+  -> WNIOSEK: specjalizacja modelu wazniejsza niz rozmiar - Qwen3-Coder (model do kodu)
+     sprawuje sie gorzej mimo ~3x wiecej parametrow. 67% akcji to social/call,
+     top strony wylacznie social media, tylko 12% agentow sie ruszalo vs 28% Bielik.
+     Uczciwe porownanie wymaga ogolnego Qwen3-30B (bez -Coder).
+[DONE] rozkmina jakosciowa - wykresy run_logs do porownania po zakonczeniu runu
+[DONE] wykres tego ile adresow ip agent odwiedza per day
+  -> run_logs/100agent_fullday/plots/ip_per_agent.png
+[DONE] upewnic sie ze to jest dzien pracujacy
+  -> tak, internetagent.py:19 START_WEEKDAY = 0 (Monday)
+
+Long term goal:
+- zmienianie czestotliwosci zapytan
+
+
+
+
+ips per device id
+
+zastanowić się jak decydować jakie lepsze prompty są
+
+zastanowić się jak debugować tych agentów - (sprawdzamy czy agent dobrze sobie radzi na jednym prompcie). Rozbić to nie na cały dzień tylko na poszczególne kroki
+
+ewentualne hard checki
+
+https://www.nxcode.io/pl/resources/news/what-is-harness-engineering-complete-guide-2026
+
+
+
+## Praca
+
+Na potem:
+Sprawozdanie:
+Wielkosc: 1 strona pol analiza bibliografii pol wyniki analiza
+
+Zmiany w sylumatorze w celu uzyskania lepszych jakosciowo/ilosciowo danych

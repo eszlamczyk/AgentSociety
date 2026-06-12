@@ -40,8 +40,8 @@ config = Config(
         LLMConfig(
             provider=LLMProviderType.PLGrid,
             base_url = None,
-            api_key="plg-yx0k9waUqMpUwK2v8J_cO1AzJTuySv9Okgf75-8sa7U",
-            model="speakleash/Bielik-11B-v3.0-Instruct",
+            api_key="plg-qLq-v9oslNaKcLRdgBGi1nyZ4-xjXe8zbR1rlI9FvGQ",
+            model="Qwen/Qwen3-Coder-30B-A3B-Instruct",
             concurrency=2000,
             timeout = 60
         )
@@ -60,7 +60,7 @@ config = Config(
         citizens=[
             AgentConfig(
                 agent_class=InternetAgent,
-                number=2000,
+                number=100,
                 memory_config_func=memory_config_internetagent,
                 memory_distributions=copy.deepcopy(DEFAULT_DISTRIBUTIONS),
                 blocks={
@@ -73,7 +73,7 @@ config = Config(
         ]
     ),  # type: ignore
     exp=ExpConfig(
-        name="internet 2000 agents 1hr throughput test",
+        name="full day 24h for bettel model",
         workflow=[
             WorkflowStepConfig(
                 type=WorkflowType.STEP,
@@ -92,7 +92,7 @@ config = default(config)
 
 
 TICKS_PER_STEP = 5 * 60   # 5 minutes of sim time per step
-N_STEPS = 12               # 12 * 5min = 1hr
+N_STEPS = 288             # 288 * 5min = 24hr
 
 
 async def main():
@@ -106,7 +106,7 @@ async def main():
         aois_with_pois = [a for a in all_aois if len(a["poi_ids"]) > 0]
         print(f"[map] POIs: {len(all_pois)}, AOIs: {len(all_aois)}, AOIs with POIs: {len(aois_with_pois)}")
 
-        metrics = MetricsCollector(out_dir="metrics/output/2000agent_throughput_test")
+        metrics = MetricsCollector(out_dir="metrics/output/100agent_fullday_model_better")
 
         for step in range(N_STEPS):
             day, tick = engine.environment.get_datetime()
