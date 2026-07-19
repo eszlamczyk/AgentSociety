@@ -12,6 +12,7 @@ from utils.websites import WEBSITE_DATABASE
 from utils.prompts import CUSTOM_DETAILED_PLAN_PROMPT, CUSTOM_BLOCK_DISPATCH_PROMPT
 from utils.ict_devices import assign_devices_to_agent, get_device_awareness_text, ICTDevice
 from utils.device_logger import log_device_usage, log_internet_browsing, log_position_change
+from utils.needs_block_custom import TimeAwareNeedsBlock
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,17 @@ class InternetAgent(SocietyAgent):
             blocks=blocks
         )
 
+        # Swap in the time-aware satisfaction evaluator (see utils/needs_block_custom.py).
+        # SocietyAgent.__init__ already constructed self.needs_block above; replace it
+        # in place since NeedsBlock isn't exposed via agent_params like the plan/dispatch
+        # prompts are.
+        self.needs_block = TimeAwareNeedsBlock(
+            toolbox=self._toolbox,
+            agent_memory=self.memory,
+            agent_context=self.context,
+            initial_prompt=self.params.need_initialization_prompt,
+        )
+
         self.last_position = None
         self.connected_antenna = None
         self.name = name
@@ -52,6 +64,11 @@ class InternetAgent(SocietyAgent):
         self.home_router = None       # HomeRouter instance for this agent's home
         self.home_xy = None           # Captured on first connection (= starting/home position)
         self.home_leased_ips: dict[str, str] = {}  # device_id -> ip when on home WiFi
+
+        # Satisfaction snapshot taken at the start of the current tick, before
+        # needs_block's decay/evaluation runs inside super().forward(). Used to
+        # log a before/after delta whenever a fresh plan is generated.
+        self._pre_tick_satisfaction: dict | None = None
 
         print(f"$ANTENA$ - {self.name} initialized with interests: {self.interests} and {len(self.known_websites)} known websites.")
 
@@ -128,6 +145,16 @@ class InternetAgent(SocietyAgent):
             "current_day_info", f"{weekday_name} ({day_type}), {sim_time}"
         )
 
+        # Snapshot satisfaction/need *before* needs_block's decay+evaluation
+        # runs inside super().forward(), so plan_generation() can log the delta.
+        self._pre_tick_satisfaction = {
+            "hunger_satisfaction": await self.memory.status.get("hunger_satisfaction"),
+            "energy_satisfaction": await self.memory.status.get("energy_satisfaction"),
+            "safety_satisfaction": await self.memory.status.get("safety_satisfaction"),
+            "social_satisfaction": await self.memory.status.get("social_satisfaction"),
+            "current_need": await self.memory.status.get("current_need"),
+        }
+
         duration = await super().forward()
 
         return duration
@@ -186,6 +213,32 @@ class InternetAgent(SocietyAgent):
 
         # Call parent step execution to actually execute the step
         await super().step_execution()
+
+    async def plan_generation(self):
+        """Override to stash start-of-plan context onto the plan itself.
+
+        We don't log here — logging a plan the moment it's generated meant the
+        satisfaction delta shown was actually the *previous* plan's evaluation
+        (evaluate_and_adjust_needs runs earlier in the same tick, right before
+        a new plan is generated for the newly-selected need), which reads as
+        if this new plan already had an effect it hasn't had yet. Instead we
+        stash the plan's starting context onto current_plan itself, and
+        TimeAwareNeedsBlock.evaluate_and_adjust_needs (utils/needs_block_custom.py)
+        logs the plan exactly once, when its own outcome is actually known.
+        """
+        cognition = await super().plan_generation()
+
+        # cognition is non-None only when a fresh plan was just generated
+        if cognition is not None:
+            current_plan = await self.memory.status.get("current_plan")
+            if current_plan and current_plan.get("target"):
+                sim_day, sim_time = self.environment.get_datetime(format_time=True)
+                current_plan["_sim_time_at_start"] = f"day{sim_day} {sim_time}"
+                current_plan["_emotion_at_start"] = await self.memory.status.get("emotion_types")
+                current_plan["_satisfaction_at_start"] = self._pre_tick_satisfaction
+                await self.memory.status.update("current_plan", current_plan)
+
+        return cognition
 
     async def _initialize_ict_devices(self):
         """Initialize ICT devices based on agent demographics"""
