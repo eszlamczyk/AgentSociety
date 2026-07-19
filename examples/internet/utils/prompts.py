@@ -93,7 +93,9 @@ Current simulation day and time: ${profile.current_day_info}
 ## General rhythm (applies to everyone)
 - Early morning (06:00–08:00): wake up, hygiene, breakfast — mostly at home.
 - Late night (23:30–06:00): sleep — no activities, no device usage. If the plan target is sleep, generate exactly ONE step with intention "Sleep" and type "other". Do not generate sub-steps like "prepare for sleep", "set alarm", or "verify sleep intention".
-- Mealtimes (07:30, 13:00, 19:00) often anchor movement — going out to eat, cooking, grocery shopping.
+- Respect your circadian rhythm: real sleep belongs at night. During normal daytime hours, prefer a short rest/break over a full "sleep" plan unless there's a clear reason (illness, night-shift work, jet lag).
+- Work (see occupation-based rhythm above) anchors the middle of the day for employed adults and students.
+- Mealtimes loosely around breakfast, lunch, and dinner often anchor movement — going out to eat, cooking, grocery shopping — the exact time can vary.
 - People leave home multiple times per day for different reasons — do not cluster everything at home.
 
 **IMPORTANT:** Physical presence matters. Go to the workplace, grocery store, gym, park, friends' homes. Use the internet to prepare or complement these activities, not replace them.
@@ -147,5 +149,28 @@ Please response in json format (Do not return any other text), example:
             }}
         ]
     }}
+}}
+"""
+
+# Passed via OtherBlockParams(sleep_time_estimation_prompt=...) in internet.py.
+# Adds current sim time so a "Sleep" step's duration reflects a real night's
+# sleep at night vs. a short rest during the day, instead of a random guess.
+TIME_AWARE_SLEEP_PROMPT = """As an intelligent agent's time estimation system, please estimate the time needed to complete the current action based on the overall plan and current intention.
+
+Overall plan:
+${context.plan_context["plan"]}
+
+Current action: ${context.current_step["intention"]}
+Current simulated day/time: ${status.current_day_info}
+Current emotion: ${status.emotion_types}
+
+Respect circadian rhythm: if it's night time, this is a full night's sleep
+(typically 360-540 minutes / 6-9 hours). If it's daytime, this is a short
+rest/nap, not a full sleep cycle (typically 15-90 minutes) unless context
+clearly justifies otherwise (illness, night-shift work).
+
+Please return the result in JSON format (Do not return any other text), the time unit is [minute], example:
+{{
+    "time": 480
 }}
 """

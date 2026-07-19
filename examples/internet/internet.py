@@ -14,8 +14,8 @@ else:
 
 from agentsociety.cityagent import default, DEFAULT_DISTRIBUTIONS
 from agentsociety.cityagent.blocks.economy_block import EconomyBlock, EconomyBlockParams
-from agentsociety.cityagent.blocks.mobility_block import MobilityBlock, MobilityBlockParams
-from agentsociety.cityagent.blocks.other_block import OtherBlock, OtherBlockParams
+from agentsociety.cityagent.blocks.mobility_block import MobilityBlockParams
+from agentsociety.cityagent.blocks.other_block import OtherBlockParams
 from agentsociety.cityagent.blocks.social_block import SocialBlock, SocialBlockParams
 from agentsociety.configs import (
     AgentsConfig,
@@ -34,6 +34,9 @@ from agentsociety.storage import DatabaseConfig
 from internetagent import InternetAgent, START_WEEKDAY
 from internet_memory_config import memory_config_internetagent
 from metrics.collect import MetricsCollector
+from utils.mobility_block_custom import MobilityBlock as ReliableMobilityBlock
+from utils.other_block_custom import OtherBlock as TimeAwareOtherBlock
+from utils.prompts import TIME_AWARE_SLEEP_PROMPT
 
 config = Config(
     llm=[
@@ -60,20 +63,22 @@ config = Config(
         citizens=[
             AgentConfig(
                 agent_class=InternetAgent,
-                number=100,
+                number=20,
                 memory_config_func=memory_config_internetagent,
                 memory_distributions=copy.deepcopy(DEFAULT_DISTRIBUTIONS),
                 blocks={
-                    MobilityBlock: MobilityBlockParams(),
+                    ReliableMobilityBlock: MobilityBlockParams(),
                     EconomyBlock: EconomyBlockParams(),
                     SocialBlock: SocialBlockParams(),
-                    OtherBlock: OtherBlockParams(),
+                    TimeAwareOtherBlock: OtherBlockParams(
+                        sleep_time_estimation_prompt=TIME_AWARE_SLEEP_PROMPT
+                    ),
                 },
             )
         ]
     ),  # type: ignore
     exp=ExpConfig(
-        name="full day 24h for bettel model",
+        name="control group - 20 agents full day",
         workflow=[
             WorkflowStepConfig(
                 type=WorkflowType.STEP,
@@ -106,7 +111,7 @@ async def main():
         aois_with_pois = [a for a in all_aois if len(a["poi_ids"]) > 0]
         print(f"[map] POIs: {len(all_pois)}, AOIs: {len(all_aois)}, AOIs with POIs: {len(aois_with_pois)}")
 
-        metrics = MetricsCollector(out_dir="metrics/output/100agent_fullday_model_better")
+        metrics = MetricsCollector(out_dir="metrics/output/20_agent_fullday_controll")
 
         for step in range(N_STEPS):
             day, tick = engine.environment.get_datetime()
