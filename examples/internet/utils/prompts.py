@@ -2,17 +2,24 @@ CUSTOM_BLOCK_DISPATCH_PROMPT = """
 Select the most appropriate block to handle the task below.
 
 Task intention: ${context.current_intention}
+Task type (already assigned during planning): ${context.current_step["type"]}
 
 Block selection rules (pick exactly one):
-- mobilityblock: moving, traveling, commuting, going somewhere, walking, driving
+- mobilityblock: moving, traveling, commuting, going somewhere, walking, driving —
+              pick this whenever the task type above is "mobility", even if the
+              step also has a shopping/social/other flavor to it (e.g. "go to the
+              gym", "walk to the grocery store", "head to a friend's place")
 - economyblock: shopping, buying, working, earning, spending money, business tasks
 - socialblock: talking to people, meeting friends/family, social interaction, chatting
 - otherblock: EVERYTHING else — including sleep, rest, relaxing, eating, cooking,
               personal hygiene, hobbies, entertainment, setting alarms, preparing for bed,
-              transitioning to sleep, waking up, exercising, reading, any activity
-              that is not movement, economic, or social
+              transitioning to sleep, waking up, a workout already happening at the
+              current location, reading, any activity that is not movement, economic,
+              or social
 
-When in doubt, choose otherblock.
+When in doubt, match the task type above: "mobility" -> mobilityblock,
+"economy" -> economyblock, "social" -> socialblock, "other" -> otherblock. Planning
+already classified this step — don't second-guess it from the intention text alone.
 """
 
 INTERNET_AWARENESS_PROMPT = """
@@ -97,8 +104,26 @@ Current simulation day and time: ${profile.current_day_info}
 - Work (see occupation-based rhythm above) anchors the middle of the day for employed adults and students.
 - Mealtimes loosely around breakfast, lunch, and dinner often anchor movement — going out to eat, cooking, grocery shopping — the exact time can vary.
 - People leave home multiple times per day for different reasons — do not cluster everything at home.
+- Exercise can go either way — a home workout (type "other", no travel needed) is just
+  as realistic as going to a gym or park (a "mobility" step to get there, then an
+  "other" step for the workout itself). Pick whichever fits your mood, the weather, and
+  how much time you have; using your phone during a gym workout (music, a fitness app)
+  is normal and fine either way. Don't default to one every time.
+- Grocery/errand shopping for physical goods (food, household items) is normally an
+  in-person trip: check prices/make a list online first if you like, but the actual
+  shopping is "check store -> go there (mobility) -> buy -> return home (mobility)".
+  Reserve a pure online-order-and-wait-for-delivery plan for things that genuinely don't
+  need a trip (a specific item only available online, being too sick/busy to go out,
+  etc.) rather than as the default.
 
 **IMPORTANT:** Physical presence matters. Go to the workplace, grocery store, gym, park, friends' homes. Use the internet to prepare or complement these activities, not replace them.
+
+Typical step patterns for common plans (for shape/inspiration, not literal targets):
+- Eating out: mobility (go to the place) -> economy/other (order, eat) -> mobility (return home)
+- Grocery run: other/economy (make a list, optionally check prices online) -> mobility (go to the store) -> economy (buy) -> mobility (return home)
+- Gym/park workout: mobility (go there) -> other (the workout itself, phone use is fine)
+- Home workout: other (the workout itself) — no mobility step needed
+- Meeting a friend in person: social (arrange it) -> mobility (go to them / the meeting place) -> social (the time together) -> mobility (return home)
 
 Notes:
 1. type can only be one of these four: mobility, social, economy, other
@@ -122,7 +147,9 @@ Notes:
      * For work: use laptop for remote tasks
      * For social: make video calls or send messages
    - If you lack internet connectivity, you CANNOT use devices (device_usage should be null)
-   - Your devices enable you to solve problems remotely without traveling
+   - Your devices are for genuinely remote tasks (work-from-home, streaming, messaging) and
+     for *preparing* for physical activities (checking prices, looking up directions) — not
+     a default substitute for grocery trips, gym visits, or seeing friends in person
 
 Please response in json format (Do not return any other text), example:
 {{
