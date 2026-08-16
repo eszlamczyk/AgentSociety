@@ -236,3 +236,243 @@ and instructed to weight time spent over step-success text, a reliable
 mobility block that can't mark a step done without actually moving, and
 plan/duration prompt tweaks discouraging daytime sleep. Not yet re-run
 against a live simulation to confirm the fixes work — that's the next step.
+
+## Addendum: model swap to Bielik-11B surfaced three more bugs (2026-08-09/16)
+
+`internet.py` was switched from `Qwen/Qwen3-Coder-30B-A3B-Instruct` to
+`speakleash/Bielik-11B-v3.0-Instruct` (smaller, weaker instruction-following).
+A fresh 20-agent full-day run on Bielik, with per-block debug instrumentation
+added to `internetagent.py`/`utils/mobility_block_custom.py`, found mobility
+had gotten *worse* — **13/19 agents (68%)** with mobility-containing plans
+produced zero position-log entries, vs 27/45 (60%) pre-fix. Tracing this
+directly against the debug output (not just the plan/position logs) found
+three distinct causes, none of which were about raw need-decay speed (that
+hypothesis was checked and ruled out: `alpha_H=0.15/hour` means hunger takes
+5.3 real hours to decay from full to threshold — a realistic rate).
+
+### Bug A: one failed step silently kills the whole plan
+
+Ground-truth trace (agent 20, day0 11:20): a plan `Contact with friends`
+(steps: social, social, **mobility**, **mobility**) was replaced by an
+unrelated plan just 5 sim-minutes later, after only its first step ever
+dispatched. `social_block.py`'s `FindPersonBlock` returns
+`{"success": False, "evaluation": "No target found in social network."}`
+**silently** (no warning logged) whenever an agent's friend list is empty —
+a routine, non-rare condition. Vendored `societyagent.py`'s
+`check_and_update_step()` treats *any* single step's `success: False` as
+failing the **entire plan** (`current_plan["failed"] = True`), which
+`update_when_plan_completed()` picks up on the very next check and nulls
+`current_plan` immediately — abandoning every step queued behind the failed
+one, including both mobility steps, without ever attempting them. Since
+plans tend to put mobility steps after prep/social steps (not first), this
+one silent, common failure mode was enough to explain most of the mobility
+gap on its own.
+
+### Bug B: MoveBlock's destination classifier is anchored toward "home"
+
+Confirmed from all 60 place-analysis calls in the run: agent 9's "Take a
+short walk indoors" and agent 11's "Commute to school" were both classified
+`"home"` (the second one wrong — school isn't home), and both agents
+happened to already be home, so `MoveBlock`'s already-there no-op shortcut
+fired and `environment.set_aoi_schedules` was never called. Root cause: the
+vendored `PLACE_ANALYSIS_PROMPT`'s only worked example is
+`{"place_type": "home"}` — classic one-shot anchoring bias, worse on a
+smaller/weaker model. Other misclassifications turned up in the same
+sample too (e.g. "Return home from workplace" -> `workplace`, backwards),
+though those don't cause silent no-ops since the agent isn't already there.
+
+### Bug C: our own satisfaction-logging code had a tick-vs-plan scope bug
+
+While tracing Bug A, plan rows showed `satisfaction_before` values that
+didn't chain to the previous plan's `satisfaction_after` at all (e.g. a
+"Contact with friends" plan logged `hunger: 0.075` as its starting point,
+one tick after the previous plan had just raised hunger to `1.0`).
+Root cause: `internetagent.py`'s `_pre_tick_satisfaction` snapshot was
+captured once per **tick**, at the very top of `forward()` — but a plan's
+completion (and its successor's generation) routinely happen **in the same
+tick** (`SocietyAgent.forward()` runs `check_and_update_step` ->
+`needs_block.forward()` [may complete the old plan] -> `plan_generation()`
+[generates the new one] end-to-end whenever a step boundary is crossed, with
+no "gap" tick in between). So the tick-start snapshot used for a freshly
+generated plan's `_satisfaction_at_start` predated its own predecessor's
+`evaluate_and_adjust_needs()` call within that same tick — every plan's
+logged starting state was actually its *predecessor's* pre-evaluation
+state, one plan-cycle stale.
+
+**This also invalidates the "same-need-repeat" methodology used earlier in
+this document and in `readable_plan_log.py`'s `[SAME NEED REPEATED]` flag**
+(`need_before == need`, both fields from a single plan row). Once the
+snapshot bug above is fixed, `need_before` and `need` become tautologically
+equal for *every* row — `current_need` cannot change during a single plan's
+own lifetime, so comparing a plan's own before/after need is comparing a
+value to itself. The old, buggy tick-scoped snapshot was — by the same
+same-tick-transition mechanic — usually capturing the *previous* plan's need
+instead, which is why it read as a meaningful (if unreliable) cross-plan
+signal before. The 76%→(pre-fix numbers above) were never a clean
+measurement; they're not being retracted as "wrong direction," just marked
+untrustworthy. See the validation-run section below for the corrected,
+consecutive-plan-comparison version of this metric.
+
+### Fixes applied (see current_changelog.md for the code)
+
+- Bug A: `InternetAgent.check_and_update_step()` override — flips a failed
+  step's `success` to `True` before delegating to the vendored logic, so
+  the plan advances to the next step instead of being abandoned. The
+  step's real failure text is left in `evaluation` so the satisfaction
+  evaluator still sees what actually happened.
+- Bug B: `utils/mobility_block_custom.py`'s `MoveBlock` now uses a prompt
+  with three balanced worked examples (workplace/other/home) instead of
+  one home-only example, plus a keyword gate — the already-there no-op
+  shortcut only fires when the step's own intention text plausibly
+  supports that destination category; otherwise it falls through to
+  picking a real destination.
+- Bug C: `InternetAgent.plan_generation()` now fetches the satisfaction/need
+  snapshot live, at the point a new plan is actually created (after any
+  same-tick predecessor evaluation has already run), instead of from a
+  once-per-tick cache.
+
+### Validation run (2026-08-16, 20 agents, Bielik, all three fixes applied)
+
+- **Mobility gap: 3/19 agents (16%)**, down from 13/19 (68%) pre-fix and
+  7/18 (39%) after the model swap alone (before this session's fixes) —
+  substantial improvement. The three still-stuck agents (2, 6, 9) each only
+  had 1-2 mobility-containing plans out of 13-36 total plans (much lower
+  exposure than before); see the "remaining stuck agents" investigation
+  below for what's still blocking them specifically.
+- **Satisfaction chaining confirmed correct**: spot-checked agent 1's first
+  six plans — each plan's `satisfaction_before` now exactly matches the
+  *previous* plan's `satisfaction_after`, closing Bug C.
+- **Corrected same-need-repeat rate**: comparing each plan's `need` to the
+  *previous* plan's `need` (per agent, chronologically) instead of the
+  now-tautological single-row `need_before == need` — **146/387 (37.7%)**
+  of consecutive plan pairs share the same need. This is the first
+  trustworthy measurement of this metric; not directly comparable to the
+  pre-fix 76%/59% numbers above since the methodology changed, not just the
+  code under test.
+- **Caveat**: `run.log` (the `$DEBUG$`-instrumented stdout capture) wasn't
+  captured for this run, so the validation above relies on `plan_logs.jsonl`
+  / `position_logs.jsonl` aggregate numbers rather than direct per-step
+  traces like the earlier investigation had. Re-run with
+  `CLEAR_LOGS_ON_START=1 python3 internet.py 2>&1 | tee run.log` for full
+  trace visibility if deeper debugging is needed.
+
+### Remaining stuck agents (2, 6, 9): a different, already-known mechanism — not a new bug
+
+`run.log` wasn't captured for the validation run, so this used
+`internet_logs/device_usage_logs.jsonl` (has per-step `sim_time` and
+`metadata.step_index`/`plan_target`) as a step-execution trace instead —
+still ground truth, since it's written at actual dispatch time, just
+without the top-level-dispatch/MoveBlock debug prints `run.log` would have
+had.
+
+**Agent 6's "Start Work" plan is the clearest evidence Bug A's fix is
+working.** Steps: economy, economy, **mobility** ("Attend to patient
+appointments"), economy, social, economy. `device_usage_logs.jsonl` shows
+step_index 0, 1 executing, then **step_index 3, 4, 5 all executing
+afterward too** — the plan continued straight through the mobility step at
+index 2 instead of dying there, exactly the behavior the check-and-update
+override was meant to produce. The mobility step itself produced no
+position-log entry, but for a doctor already at their workplace attending
+patients *at* that workplace, that's plausibly a legitimate no-op (nothing
+to travel to), not a bug.
+
+**Agents 2 and 9 both show the same pattern**: a plan runs several real
+steps (confirmed via `device_usage_logs.jsonl` timestamps spanning up to 2
+hours), then ends with the *next* need's satisfaction already below its
+own threshold — e.g. agent 2's `whatever`-need "Leisure and Entertainment"
+plan ended with `social_satisfaction: 0.182` (T_C=0.3), immediately
+followed by a `social`-need plan; agent 9's `social`-need "Contact with
+friends" plan (which reached step index 4 of 6 — "Plan the meeting
+details" — per `device_usage_logs.jsonl`, but never dispatched step 5,
+"Meet with the friend", the plan's actual payoff mobility step) ended with
+`social_satisfaction` essentially unchanged (0.102 -> 0.1), and the next
+plan's need is `social` again.
+
+This is `determine_current_need()`'s ordinary priority-based interruption
+(`needs_block.py`, vendored, untouched) — not the silent single-step-failure
+bug fixed this session. Two things make `whatever`-need plans and
+late-positioned mobility payoff steps specifically vulnerable to it: (1)
+`whatever` has no priority-guard protection at all — *any* of the four core
+needs crossing its threshold can interrupt a `whatever` plan, by design; (2)
+a plan that hasn't yet reached its actual "meet the friend" / "attend the
+event" step hasn't produced the outcome the evaluator should credit, so
+the evaluator correctly declining to mark the need satisfied is *working
+as intended*, not a bug — it's just that the same need then legitimately
+re-fires for the next plan (matches the corrected 37.7% same-need-repeat
+baseline above, not an anomaly).
+
+This is the same mechanism `current_changelog.md` already discusses and
+explicitly did **not** add a cooldown for, per prior direction ("sometimes
+I can still be hungry after eating and decide to eat a second portion,
+that's alright"). No further code change made here — flagging as
+understood-but-intentionally-unaddressed rather than an open bug.
+- `readable_plan_log.py`'s `[SAME NEED REPEATED]` flag still uses the
+  now-tautological `need_before == need` single-row comparison — should be
+  changed to compare consecutive plans per agent instead (same fix as the
+  corrected metric above).
+- The occupation-skew observation (finding #4) hasn't been revisited since
+  the model swap or any of these fixes — still flagged as lower priority,
+  not chased further.
+
+## Addendum: mundane physical activities were rare, and mostly for a prompt-level reason (2026-08-16)
+
+Follow-up question: are agents actually doing everyday out-of-home things —
+gym/exercise, grocery runs, in-person socializing, commuting — at a
+plausible rate? Measured against the validation run above (20 agents, one
+day): "Contact with friends" plans fired 9.50/agent/day but only 11.6% of
+them included a mobility step; gym/exercise was mentioned 0.40/agent/day
+and *never* included a mobility step (0%); dedicated shopping-trip plans
+were ~25% in-person, the rest pure online-order.
+
+Root-caused to four things in `utils/prompts.py`, all upstream of any
+per-agent randomness:
+1. `CUSTOM_BLOCK_DISPATCH_PROMPT`'s `otherblock` catch-all explicitly listed
+   "exercising", and its "when in doubt" fallback defaulted to `otherblock`
+   — so even a plan step correctly typed `"mobility"` by planning could get
+   redispatched to the wrong block at execution time.
+2. Traced via `device_usage_logs.jsonl`: of 13 "Contact with friends" plans
+   that never produced movement, 7 had already reached the mobility step's
+   own index before failing to move — i.e. most of this specific failure
+   mode was dispatch-time, not the priority-interruption mechanism from the
+   section above.
+3. `CUSTOM_DETAILED_PLAN_PROMPT`'s only worked JSON example was "Eat at
+   home" — a single pattern for a weak model to imitate, with no equivalent
+   shown for groceries, gym, or in-person socializing.
+4. The device-usage guidance said devices "enable you to solve problems
+   remotely without traveling", directly undercutting the prompt's own
+   "don't replace physical activities" line elsewhere.
+
+**Fixes** (`utils/prompts.py`): exposed the step's own planning-assigned
+`type` to the dispatch prompt and made both the mobility rule and the
+"when in doubt" fallback defer to it instead of guessing from wording;
+removed "exercising" from `otherblock`'s catch-all; added explicit
+either/or guidance for exercise (home workout vs. gym/park trip — agent's
+own choice, not forced, per explicit design direction); made grocery
+shopping default to an in-person trip pattern, online-only reserved for
+cases that genuinely don't need a trip; added a "Typical step patterns"
+section with five worked examples instead of relying on a single JSON
+example to carry all the pattern-matching weight; softened the
+devices-avoid-travel line to explicitly exclude grocery/gym/social as
+default substitutes.
+
+**Validated by a second run** (same day, all three fixes above applied,
+279 plans): gym/exercise mobility rate 0% -> 69% (9/13 plans), and
+manually inspected — a genuine mix of home workouts and gym/park trips,
+not a new forced default in either direction. Dedicated shopping-trip
+mobility rate ~25% -> 83% (5/6). Social-in-person mobility conversion
+11.6% -> 38%, directly confirming the dispatch-bias fix as the dominant
+lever for the "why do social plans fail to produce movement" question.
+Work/commute held flat (~53% -> 47%, within noise), as expected since that
+category wasn't targeted. Agents with a mobility-typed plan step but zero
+actual movement all day: 1/20 (5%), down from 3/19 in the previous
+validation run.
+
+The one remaining non-mover (agent 10) was traced end-to-end and is a
+different failure mode from anything above: dispatch, place-classification,
+and destination-selection all behaved correctly and the step reported
+`success: True`, but the underlying city simulator never produced a
+visible `xy_position` change for that agent/destination pair, even though
+a different agent independently sent to the exact same destination moved
+fine. Reads as a simulator-level routing/pathfinding edge case rather than
+anything in the prompt or dispatch logic — not chased further given it's
+1/20 and outside the scope of these fixes.

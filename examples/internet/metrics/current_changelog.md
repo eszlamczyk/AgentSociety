@@ -306,3 +306,303 @@ The 1-agent test run's own logs are archived at
 `archive/1_agent_structured_output_test/`. Working `plan_logs/`,
 `position_logs/`, `internet_logs/` are now empty and ready for the next
 full 20-agent run.
+
+## Model swap: Qwen3-Coder-30B -> Bielik-11B, plus debug instrumentation (2026-08-09)
+
+`internet.py`: `LLMConfig.model` changed from `Qwen/Qwen3-Coder-30B-A3B-Instruct`
+to `speakleash/Bielik-11B-v3.0-Instruct` (different API key too — see the
+file for the current value). Smaller, weaker instruction-following model;
+motivated adding `$DEBUG$`-prefixed print instrumentation (not wired to any
+log file, stdout only) to trace exactly what the framework does per step:
+
+- `internetagent.py` `__init__`: wraps `self.dispatcher.dispatch` to print
+  the step type/intention and which top-level block got selected for it.
+  `forward()`: position-change log entries gained `step_type`/`emotion`/`need`
+  fields.
+- `utils/mobility_block_custom.py`: `MoveBlock` (new, instrumented copy of
+  the vendored class) prints the raw place-analysis LLM response and flags
+  each already-there no-op branch.
+- `utils/needs_block_custom.py`: prints each raw `guided_json` response
+  attempt, and gained bounded retry (`MAX_SCHEMA_RETRIES=3`) after
+  observing Bielik return an extra unrequested key or a bare `{}` — see
+  the file's own docstring for detail. (The original "no retry, raise
+  immediately" design was for detecting whether `guided_json` was honored
+  at all; once confirmed honored-but-imperfect, a bounded retry was the
+  right next step.)
+- `packages/agentsociety/agentsociety/llm/llm.py`: `atext_request()` /
+  `LLMActor.call()` gained an `extra_body` passthrough parameter so
+  `guided_json` (and similar vLLM extras) can be passed from example code
+  without vendoring the whole LLM class.
+- `packages/agentsociety/agentsociety/cityagent/blocks/economy_block.py`:
+  `MonthEconomyPlanBlock` switched from regex-based `extract_dict_from_string`
+  to `json_repair.loads` + explicit `response_format={"type": "json_object"}`
+  — Bielik's free-form responses weren't matching the regex reliably.
+
+A 20-agent full-day run with this instrumentation found mobility had gotten
+*worse* on Bielik (13/19 agents, 68%, vs 27/45, 60%, pre-fix) — see
+`findings.md`'s "model swap to Bielik-11B surfaced three more bugs" addendum
+for the three root causes found by tracing this run's `run.log` directly.
+
+## Fix: single failed step no longer fails the whole plan (2026-08-16)
+
+Root cause (`findings.md` addendum, "Bug A"): vendored `societyagent.py`'s
+`check_and_update_step()` treats *any* step's `evaluation["success"] = False`
+as failing the entire plan — `current_plan["failed"] = True`, picked up
+immediately by `update_when_plan_completed()`, which nulls `current_plan`
+and abandons every step still queued behind the failed one. Confirmed via
+`run.log`: agent 20's "Contact with friends" plan (social, social,
+mobility, mobility) died right after step 0 got `social_block.py`'s
+`FindPersonBlock` silently returning `success: False` ("No target found in
+social network") — a routine, non-rare condition, not a crash or parse
+error. Both mobility steps behind it were never attempted.
+
+Fix: `internetagent.py` — new `InternetAgent.check_and_update_step()`
+override. Before delegating to `super().check_and_update_step()`, checks
+the current step's `evaluation["success"]`; if `False`, flips it to `True`
+in place (and logs a `$DEBUG$` line noting the override fired) so the
+vendored logic advances to the next step instead of ending the plan. The
+step's own `evaluation` *text* (e.g. "Failed to execute...") is left
+untouched, so `TimeAwareNeedsBlock.evaluate_and_adjust_needs()` still sees
+what actually happened when it scores the plan afterward — this only
+changes plan **control flow**, not what gets reported to the LLM evaluator.
+
+Deliberately not a vendored-code change: kept local to `examples/internet/`
+by overriding the method on `InternetAgent` rather than editing
+`packages/agentsociety/agentsociety/cityagent/societyagent.py` directly.
+
+## Fix: stale per-tick satisfaction snapshot (2026-08-16)
+
+Root cause (`findings.md` addendum, "Bug C"): `internetagent.py`'s
+`_pre_tick_satisfaction` was captured once per **tick**, at the top of
+`forward()`, then stashed onto a freshly-generated plan as
+`_satisfaction_at_start` in `plan_generation()`. But a plan's completion
+and its successor's generation routinely happen in the **same tick**
+(`SocietyAgent.forward()` runs check-step -> needs-block -> plan-generation
+end-to-end whenever a step boundary is crossed, no gap tick in between) —
+so the tick-start snapshot predated the *predecessor* plan's own
+`evaluate_and_adjust_needs()` call within that same tick. Every fresh
+plan's logged "starting" satisfaction was actually one plan-cycle stale.
+
+Fix: removed `self._pre_tick_satisfaction` and the tick-start snapshot
+entirely (`InternetAgent.forward()` no longer takes one).
+`InternetAgent.plan_generation()` now builds the `_satisfaction_at_start`
+dict from a **live** `memory.status.get(...)` fetch, taken right after
+`super().plan_generation()` returns (i.e. after `needs_block.forward()`
+has already run for this tick, so any same-tick predecessor evaluation is
+reflected). Verified against the 2026-08-16 validation run: consecutive
+plans' `satisfaction_before`/`satisfaction_after` now chain exactly.
+
+**Side effect worth knowing about**: this makes `need_before` (also part of
+the stashed snapshot) tautologically equal to `need` on every row, since
+`current_need` cannot change during a single plan's own lifetime once the
+snapshot is correctly plan-scoped. `readable_plan_log.py`'s
+`[SAME NEED REPEATED]` flag (`need_before == need`) is now meaningless as
+written — see "Known issues / next todos" below.
+
+## Fix: MoveBlock destination classification bias (2026-08-16)
+
+Root cause (`findings.md` addendum, "Bug B"): the vendored
+`PLACE_ANALYSIS_PROMPT`'s only worked example is `{"place_type": "home"}` —
+anchors a weaker model toward answering "home" for ambiguous intentions.
+Confirmed from `run.log`: agent 11's "Commute to school" got classified
+`"home"`; since the agent was already home, `MoveBlock`'s already-there
+no-op shortcut silently returned success without calling
+`environment.set_aoi_schedules`.
+
+Fix, both in `utils/mobility_block_custom.py`'s `MoveBlock`:
+1. New `CUSTOM_PLACE_ANALYSIS_PROMPT` (set via a new `__init__` override)
+   — same shape as the vendored prompt, but with three balanced worked
+   examples (workplace/other/home) instead of one, plus an explicit
+   "don't default to home" instruction.
+2. Keyword gate on the no-op shortcut: `_intention_supports()` checks the
+   step's own intention text against `_HOME_KEYWORDS`
+   (`home`/`house`/`apartment`) or `_WORKPLACE_KEYWORDS`
+   (`work`/`office`/`job`/`shift`/`school`/`class`/`meeting`/`commute`)
+   before trusting an already-there no-op. If the classification lands on
+   `home`/`workplace`, the agent's already there, *and* the intention text
+   doesn't support that category, the response is remapped to `"other"` so
+   the step falls through to the generic real-destination-search branch
+   instead of silently completing as a no-op.
+
+## Validation run (2026-08-16, 20 agents, Bielik, all three fixes above applied)
+
+Run via `CLEAR_LOGS_ON_START=1 python3 internet.py` (no `run.log` capture
+this time — see "Known issues" below). Results, full detail in
+`findings.md`'s validation-run section:
+
+- Mobility gap (agents with mobility plans, zero position-log entries):
+  **3/19 (16%)**, down from 13/19 (68%) pre-fix and 7/18 (39%) after the
+  model swap alone.
+- Satisfaction chaining confirmed correct (spot-checked agent 1).
+- Corrected same-need-repeat rate (consecutive-plan comparison, not the
+  now-tautological single-row one): **146/387 (37.7%)**.
+
+## Known issues / next todos
+
+- **`readable_plan_log.py`'s `[SAME NEED REPEATED]` flag is now
+  tautological** (`need_before == need` always true post-fix — see the
+  stale-snapshot fix above). Needs to be changed to compare each plan's
+  `need` against the *previous* plan's `need` (per agent, chronologically)
+  to remain meaningful. Not yet fixed.
+- **`run.log` wasn't captured for the 2026-08-16 validation run** — the
+  aggregate `plan_logs.jsonl`/`position_logs.jsonl` numbers are trustworthy,
+  but there's no per-step `$DEBUG$` trace to directly confirm which
+  mechanism (step-skip vs. MoveBlock distrust-fallback) fired for any given
+  now-moving agent. Re-run with
+  `CLEAR_LOGS_ON_START=1 python3 internet.py 2>&1 | tee run.log` if that
+  level of confidence is needed again.
+- **Agents 2, 6, 9 still have mobility-containing plans that never move**
+  in the validation run — investigated using `internet_logs/device_usage_logs.jsonl`
+  as a step-execution trace (no `run.log` for this run). Conclusion: not a
+  new bug. Agent 6's "Start Work" plan is direct confirmation the
+  single-step-failure fix works — it ran straight through its mobility step
+  (index 2) to steps 3-5 instead of dying, the mobility step itself just
+  being a plausible legitimate no-op (already at workplace). Agents 2 and 9
+  both show ordinary `determine_current_need()` priority interruption (a
+  `whatever`-need plan losing to any of the four core needs by design, and
+  a `social`-need plan cut off before its final "meet the friend" payoff
+  step, with the evaluator correctly not crediting an unreached outcome) —
+  the same mechanism `current_changelog.md` already discusses and
+  explicitly didn't add a cooldown for per prior direction. See
+  `findings.md`'s "Remaining stuck agents" section for the full trace. No
+  code change made; this is intentionally-unaddressed, not an open bug.
+- The append-mode log files issue (`plan_logger.py`/`device_logger.py`/
+  `antennas.py` never clearing between runs unless `CLEAR_LOGS_ON_START=1`
+  is set) is mitigated but still opt-in, not the default — still flagged,
+  not changed.
+- Occupation-skew observation (finding #4) not revisited since the model
+  swap.
+
+## Investigated: how often do agents do mundane physical errands, and why so rarely (2026-08-16)
+
+Prompted by the "why does social interaction fail so often" question — quantified
+gym/exercise, grocery shopping, socializing-in-person, and work-commuting from
+the validation run's `plan_logs.jsonl` (20 agents, 1 day):
+
+| activity | plans/agent/day | with a mobility step | agents who ever do it |
+|---|---|---|---|
+| contact friends | 9.50 | 11.6% | 13/20 in-person ever, 7/20 never |
+| work | 1.90 | 52.6% (commute) | 14/20 ever commute, 4/20 never |
+| shopping/groceries | 0.40 | ~25% genuine trips | 4/20 ever shop at all |
+| gym/workout | 0.40 mentions | **0%** | 3/20 (fitness occupations only) |
+
+Root causes found in `utils/prompts.py`, all the same family of bug (anchoring
+bias toward the one pattern the model is shown/told, same as the earlier
+`MoveBlock` destination-classifier fix — just one layer up):
+
+1. **`CUSTOM_BLOCK_DISPATCH_PROMPT`'s `otherblock` catch-all explicitly listed
+   "exercising"**, directly contradicting the plan prompt's own "go to the gym"
+   instruction — so even the rare workout that got planned never routed through
+   `mobilityblock`.
+2. **The same prompt's "When in doubt, choose otherblock" default** biases
+   dispatch away from `mobilityblock` in general, and it doesn't even see the
+   step's own `type` (already assigned during planning) to check against —
+   already caught in the wild during the original investigation:
+   `top-level dispatch for InternetAgent_18: step_type='mobility' ... -> OtherBlock`.
+   Traced 13 "Contact with friends" plans that had a mobility step but produced
+   no position-log entry against `device_usage_logs.jsonl`'s per-step trace: 7
+   of 13 clearly reached the mobility step's own index before failing to
+   move — i.e. most of this specific failure mode is dispatch-time, not the
+   priority-interruption mechanism from the earlier investigation.
+3. **`CUSTOM_DETAILED_PLAN_PROMPT`'s only worked example is "Eat at home"** —
+   a single pattern for the model to imitate, with no equivalent shown for
+   groceries, gym, or in-person socializing.
+4. **Grocery-specific**: `INTERNET_AWARENESS_PROMPT`/the device-usage section
+   said devices "enable you to solve problems remotely without traveling",
+   directly undercutting the "don't replace physical activities" line
+   elsewhere. Of 8 shopping-labeled plans all day, 6 were pure
+   online-order-and-wait-for-delivery with zero physical step.
+
+### Fixes (all in `utils/prompts.py`)
+
+- `CUSTOM_BLOCK_DISPATCH_PROMPT`: added `${context.current_step["type"]}` to
+  the prompt so dispatch can see planning's own type tag; mobilityblock's rule
+  now explicitly says to pick it whenever type is "mobility" regardless of
+  intention wording; "when in doubt" now defers to the declared type instead
+  of defaulting to otherblock; "exercising" removed from the otherblock
+  catch-all (replaced with "a workout already happening at the current
+  location", which only applies once a mobility step has already gotten the
+  agent there or a home workout was chosen).
+- `CUSTOM_DETAILED_PLAN_PROMPT`: new "General rhythm" bullets giving exercise
+  an explicit *either/or* — home workout (type "other", no travel) or
+  gym/park (mobility there + other for the workout, phone use during is
+  fine) — agent's choice based on mood/weather/time, not a hard requirement
+  either way (per explicit user direction: don't force movement, let the
+  agent decide). A second bullet makes grocery/errand shopping default to an
+  in-person trip pattern, with pure online delivery reserved for cases that
+  genuinely don't need one. New "Typical step patterns" section gives five
+  worked step-shape examples (eating out, grocery run, gym workout, home
+  workout, meeting a friend in person) instead of relying on the single
+  "Eat at home" JSON example to carry all the pattern-matching weight. The
+  device-usage section's "solve problems remotely without traveling" line
+  softened to explicitly exclude grocery/gym/social as default substitutes.
+
+**Verification**: `python3 -m py_compile utils/prompts.py` and
+`import internet` (via the project venv) both succeed. **Not yet re-run
+against a live simulation** — next step is a fresh validation run to check
+whether gym/grocery/social-mobility rates actually move.
+
+## Validation run (2026-08-16, 20 agents, Bielik, gym/groceries/dispatch-bias fixes applied)
+
+User re-ran with `CLEAR_LOGS_ON_START=1 python3 internet.py 2>&1 | tee run.log`
+(279 plans, one simulated day, `run.log` captured in full this time).
+
+**Headline mobility-gap number**: agents with mobility-typed plan steps but
+zero actual position change all day: **1/20 (5%)**, down from 3/19 (16%) in
+the previous validation run and 68% pre-fix. `20/20` agents now have at
+least one mobility-typed plan step, `19/20` produced at least one real
+position change.
+
+**Category breakdown (this run)**:
+- **Gym/workout**: 13 plans mentioned it, 9 (69%) included a mobility step
+  — up from 0% (0 of ~8) before the fix. Manually inspected all 13: it's a
+  genuine mix, not a new default — home workouts (agents 6, 12, 18's first
+  plan, agent 1's 03:55 plan) sit alongside gym/park trips (agents 1, 17,
+  18's second plan), matching the "let the agent decide" design goal rather
+  than forcing either direction.
+- **Dedicated shopping-trip plans** (plan_target containing "Shopping" /
+  "Grocery shopping", as opposed to "Eat at home" plans that merely mention
+  checking grocery inventory before cooking): 6 plans, 5 (83%) went
+  in-person. The one online-only case (agent 4, 19:10) reads as a genuine
+  "already handled dinner another way" case, not a default.
+- **Social-in-person** (plans/steps mentioning meeting/hanging out with a
+  friend): 105 mentions, 40 (38%) included a mobility step — up from 11.6%
+  before the fix. Directly answers the "why do social interactions fail so
+  often" question from last round: the dispatch-bias fix (exposing
+  `current_step["type"]` to the dispatcher, deferring to it instead of
+  defaulting to otherblock) was the dominant lever, consistent with the
+  prior finding that most of this failure mode was dispatch-time rather
+  than priority-interruption.
+- **Work/commute**: 43 plans, 20 (47%) mobility — flat vs. the ~53% baseline
+  (within noise for a single-day run of this size); expected, since this
+  category wasn't targeted by the fix and was already working.
+
+**The one remaining non-mover (agent 10, "Grace")**: traced end-to-end via
+`run.log`. Dispatch correctly routed the step to `MobilityBlock`
+(`step_type='mobility'`), `MoveBlock` place-analysis correctly returned
+`place_type='other'` (no home/workplace anchoring bias), `PlaceSelectionBlock`
+successfully picked a destination (`('', 700002473)`), and the step's own
+evaluation reported `success=True`. The same POI was independently selected
+earlier in the run for a different agent (8), who *did* show a real position
+change immediately after. Yet agent 10's `xy_position` never changed for the
+entire simulated day (0 entries in `position_logs.jsonl` for agent_id 10) —
+including on the very next tick, when position is checked at the top of
+`forward()` before the following step executes. This means
+`environment.set_aoi_schedules()` was called and returned without raising,
+but the underlying city simulator never produced a visible position update
+for this specific agent/destination pair — most plausibly a routing/pathfinding
+edge case in the vendored simulator (e.g. no path found from agent 10's
+current position to that POI) rather than anything in our prompt/dispatch
+fixes, since every other step of the diagnostic chain (dispatch type, place
+classification, destination selection, step evaluation) behaved correctly.
+**Not the same mechanism as the previously-diagnosed agents 2/6/9**
+(priority-interruption before reaching the mobility step) — this one
+reached and "completed" the mobility step per our own bookkeeping, but the
+simulator didn't move the agent. Not chased further given it's 1/20 and
+outside the scope of the prompt-level fixes; worth another look if it
+recurs across future runs.
+
+**Conclusion**: all three fixes from the previous section (dispatch-bias,
+exercise either/or, grocery in-person default) validated — each targeted
+category moved in the expected direction, with the social-in-person number
+in particular jumping from 11.6% to 38%.
