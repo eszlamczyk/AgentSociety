@@ -19,6 +19,13 @@ os.makedirs(PLAN_LOG_DIR, exist_ok=True)
 PLAN_LOG_PATH = os.path.join(PLAN_LOG_DIR, "plan_logs.jsonl")
 _plan_log_lock = threading.Lock()
 
+# Same append-mode-persists-across-runs issue as antennas.py's logs (see
+# current_changelog.md). Set CLEAR_LOGS_ON_START=1 to truncate once here at
+# import time, before any run writes to it.
+if os.environ.get("CLEAR_LOGS_ON_START", "0") == "1":
+    open(PLAN_LOG_PATH, "w").close()
+    print(f"$DEBUG$ - CLEAR_LOGS_ON_START=1: truncated {PLAN_LOG_PATH}")
+
 
 _SATISFACTION_KEYS = (
     "hunger_satisfaction",

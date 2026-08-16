@@ -35,6 +35,19 @@ FULL_DEVICE_CONNECTION_LOG_PATH = os.path.join(GLOBAL_LOG_DIR, GLOBAL_DEVICE_CON
 FULL_DEVICE_USAGE_LOG_PATH = os.path.join(GLOBAL_LOG_DIR, GLOBAL_DEVICE_USAGE_LOG_FILE)
 FULL_POSITION_LOG_PATH = os.path.join(POSITION_LOG_DIR, "position_logs.jsonl")
 
+# These logs are opened in append mode and otherwise persist across runs
+# (see current_changelog.md). Set CLEAR_LOGS_ON_START=1 to truncate them
+# once here at import time, before any run writes to them.
+if os.environ.get("CLEAR_LOGS_ON_START", "0") == "1":
+    for _log_path in (
+        FULL_GLOBAL_LOG_PATH,
+        FULL_DEVICE_CONNECTION_LOG_PATH,
+        FULL_DEVICE_USAGE_LOG_PATH,
+        FULL_POSITION_LOG_PATH,
+    ):
+        open(_log_path, "w").close()
+    print(f"$DEBUG$ - CLEAR_LOGS_ON_START=1: truncated internet/device/position logs in {GLOBAL_LOG_DIR}/, {POSITION_LOG_DIR}/")
+
 # Create locks for thread-safe file writing
 log_file_lock = threading.Lock()
 device_connection_lock = threading.Lock()

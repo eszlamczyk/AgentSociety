@@ -87,6 +87,9 @@ def log_position_change(
     sim_time: Optional[str] = None,
     plan_target: Optional[str] = None,
     step_intention: Optional[str] = None,
+    step_type: Optional[str] = None,
+    emotion: Optional[str] = None,
+    need: Optional[str] = None,
 ):
     """
     Log an agent's position change.
@@ -101,6 +104,9 @@ def log_position_change(
         sim_time: Simulated time string
         plan_target: High-level goal the agent is pursuing (e.g. "Work", "Shopping")
         step_intention: Current step being executed (e.g. "Commute to work")
+        step_type: Plan step type (mobility/economy/social/other)
+        emotion: Agent's current emotion type string (e.g. "Anxious")
+        need: Agent's current need (hungry/tired/safe/social/whatever)
     """
     entry = {
         "timestamp": datetime.datetime.now().isoformat(),
@@ -113,6 +119,9 @@ def log_position_change(
         "connectivity": connectivity,
         "plan_target": plan_target,
         "step_intention": step_intention,
+        "step_type": step_type,
+        "emotion": emotion,
+        "need": need,
     }
 
     with position_log_lock:

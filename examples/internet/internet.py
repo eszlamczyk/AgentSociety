@@ -43,8 +43,8 @@ config = Config(
         LLMConfig(
             provider=LLMProviderType.PLGrid,
             base_url = None,
-            api_key="plg-qLq-v9oslNaKcLRdgBGi1nyZ4-xjXe8zbR1rlI9FvGQ",
-            model="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            api_key="plg-BWGsh-yoy80SV0w16cDpND01lW0evlBRx1qknt7CDKk",
+            model="speakleash/Bielik-11B-v3.0-Instruct",
             concurrency=2000,
             timeout = 60
         )
