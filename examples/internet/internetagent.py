@@ -48,6 +48,27 @@ class InternetAgent(SocietyAgent):
             initial_prompt=self.params.need_initialization_prompt,
         )
 
+        # Debug-only: log which top-level block step_execution() (societyagent.py:692)
+        # actually selects for each step. Investigating why MoveBlock (see
+        # utils/mobility_block_custom.py) is getting zero calls on Bielik despite
+        # plans containing mobility-typed steps — either the top-level dispatcher's
+        # forced tool-calling (agent/dispatcher.py's BlockDispatcher.dispatch())
+        # isn't reliable on this model, or CUSTOM_BLOCK_DISPATCH_PROMPT's "when in
+        # doubt, choose otherblock" line is steering it away from mobilityblock.
+        # Wraps rather than duplicates dispatch() so the vendored selection logic
+        # stays untouched; only observes input/output. Not wired to any log file —
+        # stdout only, same as the other $DEBUG$ prints in this file.
+        _original_dispatch = self.dispatcher.dispatch
+
+        async def _instrumented_dispatch(context, _orig=_original_dispatch, _agent_name=name):
+            selected = await _orig(context)
+            step_type = (context.get("current_step") or {}).get("type")
+            intention = context.get("current_intention")
+            print(f"$DEBUG$ - top-level dispatch for {_agent_name}: step_type={step_type!r} intention={intention!r} -> {selected.__class__.__name__ if selected else None}")
+            return selected
+
+        self.dispatcher.dispatch = _instrumented_dispatch
+
         self.last_position = None
         self.connected_antenna = None
         self.name = name
@@ -64,11 +85,6 @@ class InternetAgent(SocietyAgent):
         self.home_router = None       # HomeRouter instance for this agent's home
         self.home_xy = None           # Captured on first connection (= starting/home position)
         self.home_leased_ips: dict[str, str] = {}  # device_id -> ip when on home WiFi
-
-        # Satisfaction snapshot taken at the start of the current tick, before
-        # needs_block's decay/evaluation runs inside super().forward(). Used to
-        # log a before/after delta whenever a fresh plan is generated.
-        self._pre_tick_satisfaction: dict | None = None
 
         print(f"$ANTENA$ - {self.name} initialized with interests: {self.interests} and {len(self.known_websites)} known websites.")
 
@@ -107,12 +123,17 @@ class InternetAgent(SocietyAgent):
                 current_plan = await self.memory.status.get("current_plan")
                 plan_target = None
                 step_intention = None
+                step_type = None
                 if current_plan:
                     plan_target = current_plan.get("target")
                     steps = current_plan.get("steps", [])
                     idx = current_plan.get("index", 0)
                     if steps and idx < len(steps):
                         step_intention = steps[idx].get("intention")
+                        step_type = steps[idx].get("type")
+
+                emotion = await self.memory.status.get("emotion_types")
+                need = await self.memory.status.get("current_need")
 
                 log_position_change(
                     agent_id=self.id,
@@ -126,6 +147,9 @@ class InternetAgent(SocietyAgent):
                     sim_time=f"day{sim_day} {sim_time}",
                     plan_target=plan_target,
                     step_intention=step_intention,
+                    step_type=step_type,
+                    emotion=emotion,
+                    need=need,
                 )
 
         # Update internet connectivity and device awareness in memory
@@ -144,16 +168,6 @@ class InternetAgent(SocietyAgent):
         await self.memory.status.update(
             "current_day_info", f"{weekday_name} ({day_type}), {sim_time}"
         )
-
-        # Snapshot satisfaction/need *before* needs_block's decay+evaluation
-        # runs inside super().forward(), so plan_generation() can log the delta.
-        self._pre_tick_satisfaction = {
-            "hunger_satisfaction": await self.memory.status.get("hunger_satisfaction"),
-            "energy_satisfaction": await self.memory.status.get("energy_satisfaction"),
-            "safety_satisfaction": await self.memory.status.get("safety_satisfaction"),
-            "social_satisfaction": await self.memory.status.get("social_satisfaction"),
-            "current_need": await self.memory.status.get("current_need"),
-        }
 
         duration = await super().forward()
 
@@ -214,6 +228,40 @@ class InternetAgent(SocietyAgent):
         # Call parent step execution to actually execute the step
         await super().step_execution()
 
+    async def check_and_update_step(self):
+        """Override: don't let one failed step abort every step still queued behind it.
+
+        Vendored check_and_update_step() (societyagent.py) treats a step's
+        evaluation["success"]=False as failing the *whole plan* — it sets
+        current_plan["failed"]=True, which update_when_plan_completed() picks
+        up on the very next check and nulls current_plan immediately,
+        abandoning every remaining step. Traced via run.log: agent 20's
+        "Contact with friends" plan (social, social, mobility, mobility) died
+        right after step 0 ("Use smartphone for social interaction") got
+        SocialBlock's silent `success: False, evaluation: "No target found in
+        social network"` — the two mobility steps queued behind it were never
+        attempted. Mobility steps tend to sit later in a plan (after
+        prep/social steps), so they were disproportionately the ones losing
+        out to this.
+
+        Flipping success to True before delegating makes the vendored logic
+        advance to the next step instead of ending the plan — the step's own
+        `evaluation` text (e.g. "Failed to execute ...") is left untouched, so
+        evaluate_and_adjust_needs still sees what actually happened when it
+        scores the plan afterward.
+        """
+        current_plan = await self.memory.status.get("current_plan", False)
+        if current_plan:
+            step_index = current_plan.get("index", 0)
+            steps = current_plan.get("steps", [])
+            if step_index < len(steps):
+                evaluation = steps[step_index].get("evaluation")
+                if evaluation and evaluation.get("success") is False:
+                    print(f"$DEBUG$ - {self.name}: step {step_index} ({steps[step_index].get('intention')!r}) failed ({evaluation.get('evaluation')!r}) — skipping instead of aborting the plan")
+                    evaluation["success"] = True
+                    await self.memory.status.update("current_plan", current_plan)
+        return await super().check_and_update_step()
+
     async def plan_generation(self):
         """Override to stash start-of-plan context onto the plan itself.
 
@@ -225,6 +273,18 @@ class InternetAgent(SocietyAgent):
         stash the plan's starting context onto current_plan itself, and
         TimeAwareNeedsBlock.evaluate_and_adjust_needs (utils/needs_block_custom.py)
         logs the plan exactly once, when its own outcome is actually known.
+
+        The satisfaction/need snapshot itself must be fetched fresh right here,
+        not cached from the top of the tick: needs_block.forward() (decay +
+        update_when_plan_completed + determine_current_need) already ran
+        earlier in this same forward() call, and can both finish the *previous*
+        plan and select the need for *this* one in the same tick — a tick-start
+        snapshot would predate the previous plan's own evaluation and mislabel
+        this plan's true starting state (confirmed via run.log: a plan
+        generated the instant its predecessor completed was logged with
+        need_before/satisfaction_before from before that predecessor's
+        evaluate_and_adjust_needs call, not the actual values in effect when
+        this plan started).
         """
         cognition = await super().plan_generation()
 
@@ -235,7 +295,13 @@ class InternetAgent(SocietyAgent):
                 sim_day, sim_time = self.environment.get_datetime(format_time=True)
                 current_plan["_sim_time_at_start"] = f"day{sim_day} {sim_time}"
                 current_plan["_emotion_at_start"] = await self.memory.status.get("emotion_types")
-                current_plan["_satisfaction_at_start"] = self._pre_tick_satisfaction
+                current_plan["_satisfaction_at_start"] = {
+                    "hunger_satisfaction": await self.memory.status.get("hunger_satisfaction"),
+                    "energy_satisfaction": await self.memory.status.get("energy_satisfaction"),
+                    "safety_satisfaction": await self.memory.status.get("safety_satisfaction"),
+                    "social_satisfaction": await self.memory.status.get("social_satisfaction"),
+                    "current_need": await self.memory.status.get("current_need"),
+                }
                 await self.memory.status.update("current_plan", current_plan)
 
         return cognition
@@ -302,11 +368,11 @@ class InternetAgent(SocietyAgent):
     async def _select_website_for_task(self, task_type: str, action_description: str = "") -> str:
         """
         Use LLM to select an appropriate website based on task type and action description.
-        
+
         Args:
             task_type: Type of task (browse, shop, work, stream, social, call)
             action_description: Specific description of what the agent is doing
-            
+
         Returns:
             Website URL or generic fallback
         """
@@ -316,13 +382,13 @@ class InternetAgent(SocietyAgent):
             top_sites = sorted(self.known_websites, key=lambda x: x.get('score', 0), reverse=True)[:5]
             sites_list = [f"{w['website']} (visited {w.get('count', 1)} times)" for w in top_sites]
             known_websites_context = f"\n\nAgent's frequently visited websites:\n" + "\n".join(f"- {s}" for s in sites_list)
-        
+
         # Build interests context
         interests_context = ""
         if self.interests:
             top_interests = sorted(self.interests.items(), key=lambda x: x[1], reverse=True)[:3]
             interests_context = f"\n\nAgent's main interests: {', '.join(f'{k} ({v}/10)' for k, v in top_interests)}"
-        
+
         # Pull candidate sites from the database for this action type
         action_type_pools = {
             "work":   WEBSITE_DATABASE.get("work_tools", []),
