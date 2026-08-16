@@ -128,6 +128,7 @@ class LLMActor:
         tools: Union[List[ChatCompletionToolParam], NotGiven] = NOT_GIVEN,
         tool_choice: Union[ChatCompletionToolChoiceOptionParam, NotGiven] = NOT_GIVEN,
         agent_id: Optional[int] = None,
+        extra_body: Optional[dict] = None,
     ):
         """
         Sends an asynchronous text request to the configured LLM API.
@@ -149,6 +150,7 @@ class LLMActor:
             - `retries`: Number of retry attempts in case of failure. Default is 10.
             - `tools`: List of dictionaries describing the tools that can be called by the model. Default is NOT_GIVEN.
             - `tool_choice`: Dictionary specifying how the model should choose from the provided tools. Default is NOT_GIVEN.
+            - `extra_body`: Extra fields passed directly to the API request body (e.g. {"guided_json": schema} for vLLM constrained generation). Default is None.
 
         - **Returns**:
             - A string containing the message content or a dictionary with tool call arguments if tools are used.
@@ -192,6 +194,7 @@ class LLMActor:
                     timeout=timeout,
                     tools=tools,
                     tool_choice=tool_choice,
+                    extra_body=extra_body,
                 )
                 if response.usage is not None:
                     log["input_tokens"] += response.usage.prompt_tokens
@@ -338,6 +341,7 @@ class LLM:
         retries: int = 10,
         tools: NotGiven = NOT_GIVEN,
         tool_choice: NotGiven = NOT_GIVEN,
+        extra_body: Optional[dict] = None,
     ) -> str: ...
 
     @overload
@@ -356,6 +360,7 @@ class LLM:
         retries: int = 10,
         tools: List[ChatCompletionToolParam] = [],
         tool_choice: ChatCompletionToolChoiceOptionParam = "auto",
+        extra_body: Optional[dict] = None,
     ) -> Any: ...
 
     async def atext_request(
@@ -373,6 +378,7 @@ class LLM:
         retries: int = 10,
         tools: Union[List[ChatCompletionToolParam], NotGiven] = NOT_GIVEN,
         tool_choice: Union[ChatCompletionToolChoiceOptionParam, NotGiven] = NOT_GIVEN,
+        extra_body: Optional[dict] = None,
     ):
         """
         Sends an asynchronous text request to the configured LLM API.
@@ -393,6 +399,7 @@ class LLM:
             - `retries`: Number of retry attempts in case of failure. Default is 10.
             - `tools`: List of dictionaries describing the tools that can be called by the model. Default is NOT_GIVEN.
             - `tool_choice`: Dictionary specifying how the model should choose from the provided tools. Default is NOT_GIVEN.
+            - `extra_body`: Extra fields passed directly to the API request body (e.g. {"guided_json": schema} for vLLM constrained generation). Default is None.
 
         - **Returns**:
             - A string containing the message content or a dictionary with tool call arguments if tools are used.
@@ -421,6 +428,7 @@ class LLM:
                 tools,
                 tool_choice,
                 current_agent_id.get(),
+                extra_body,
             )
             self._log_list.append(log)
             self.prompt_tokens_used += log["input_tokens"]

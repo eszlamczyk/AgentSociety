@@ -38,13 +38,17 @@ to reflect that. Requiring all four every time removes that restriction —
 the prompt tells the model to leave dimensions the plan didn't affect
 roughly where they were, not to reset them.
 
-No retry-on-bad-shape: if the response doesn't parse or doesn't have the
-required keys, this raises immediately and visibly — that's a signal
-`guided_json` isn't being honored by the backend, not something to paper
-over by asking again. This is separate from (and doesn't touch) llm.
-atext_request()'s own built-in retry loop (default retries=10, exponential
-backoff) for genuine transient failures — connection errors, timeouts,
-API errors — which still applies underneath this call exactly as before.
+Bounded retry-on-bad-shape (added after observing Bielik-11B on PLGrid
+return an extra unrequested key, and separately a bare `{}`): if the
+parsed response is missing any required key, re-ask up to
+MAX_SCHEMA_RETRIES times. Extra/unrequested keys are harmless and kept
+as-is (only SATISFACTION_KEYS are ever read). If every attempt still comes
+back missing keys, this raises immediately and visibly rather than
+treating missing data as "no change" — still no silent accept-and-move-on.
+This is separate from (and doesn't touch) llm.atext_request()'s own
+built-in retry loop (default retries=10, exponential backoff) for genuine
+transient failures — connection errors, timeouts, API errors — which still
+applies underneath each attempt exactly as before.
 
 It also logs each plan's satisfaction outcome here, at completion time,
 instead of at generation time (see internetagent.py's plan_generation()).
@@ -72,6 +76,13 @@ SATISFACTION_KEYS = (
     "safety_satisfaction",
     "social_satisfaction",
 )
+
+# Some backends (confirmed: Bielik-11B on PLGrid) don't actually honor
+# guided_json — observed responses included an extra unrequested key and,
+# separately, a bare `{}`. Extra keys are harmless (we only ever read
+# SATISFACTION_KEYS below); a response missing required keys gets re-asked
+# up to this many times before we give up and raise loudly.
+MAX_SCHEMA_RETRIES = 3
 
 SATISFACTION_SCHEMA = {
     "type": "object",
@@ -167,15 +178,37 @@ class TimeAwareNeedsBlock(_VendoredNeedsBlock):
         )
 
         # atext_request() still retries internally (default retries=10) on
-        # connection errors / timeouts / API errors. What we do NOT do here
-        # is retry on a malformed/wrong-shape response — json.loads and the
-        # key lookups below raise immediately and visibly if that happens.
-        response = await self.llm.atext_request(
-            self.evaluation_prompt.to_dialog(),
-            response_format={"type": "json_object"},
-            extra_body={"guided_json": SATISFACTION_SCHEMA},
-        )
-        new_satisfaction = json.loads(response)
+        # connection errors / timeouts / API errors — untouched, applies
+        # underneath every attempt below. What's handled here is a separate
+        # failure mode: the backend not honoring guided_json's required-keys
+        # constraint (missing keys, e.g. a bare `{}`). We re-ask up to
+        # MAX_SCHEMA_RETRIES times; extra/unrequested keys are fine as-is
+        # since only SATISFACTION_KEYS are ever read. Still no silent
+        # accept-and-move-on: if every attempt comes back short, this raises
+        # visibly rather than treating missing data as "no change".
+        new_satisfaction = None
+        last_response = None
+        for attempt in range(1, MAX_SCHEMA_RETRIES + 1):
+            response = await self.llm.atext_request(
+                self.evaluation_prompt.to_dialog(),
+                response_format={"type": "json_object"},
+                extra_body={"guided_json": SATISFACTION_SCHEMA},
+            )
+            print(f"$DEBUG$ - raw guided_json response for evaluate_and_adjust_needs (attempt {attempt}/{MAX_SCHEMA_RETRIES}): {response!r}")
+            try:
+                parsed = json.loads(response)
+            except (json.JSONDecodeError, TypeError):
+                parsed = {}
+            if all(key in parsed for key in SATISFACTION_KEYS):
+                new_satisfaction = parsed
+                break
+            last_response = response
+        else:
+            raise ValueError(
+                f"evaluate_and_adjust_needs: guided_json response missing required "
+                f"keys after {MAX_SCHEMA_RETRIES} attempts; last response: {last_response!r}"
+            )
+
         for key in SATISFACTION_KEYS:
             await self.memory.status.update(key, new_satisfaction[key])
 

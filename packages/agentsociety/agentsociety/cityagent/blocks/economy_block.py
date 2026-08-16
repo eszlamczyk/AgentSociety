@@ -497,13 +497,17 @@ class MonthEconomyPlanBlock(Block):
                     mode="merge",
                 )
                 dialog_queue = await self.memory.status.get("dialog_queue")
-                content = await self.llm.atext_request(list(dialog_queue), timeout=300)
+                content = await self.llm.atext_request(
+                    list(dialog_queue),
+                    timeout=300,
+                    response_format={"type": "json_object"},
+                )
                 await self.memory.status.update(
                     "dialog_queue",
                     [{"role": "assistant", "content": content}],
                     mode="merge",
                 )
-                propensity_dict = extract_dict_from_string(content)[0]
+                propensity_dict = json_repair.loads(content)
                 work_propensity, consumption_propensity = (
                     propensity_dict["work"],
                     propensity_dict["consumption"],
