@@ -132,7 +132,6 @@ class MoveBlock(_VendoredMoveBlock):
             self.placeAnalysisPrompt.to_dialog(),
             response_format={"type": "json_object"},
         )
-        print(f"$DEBUG$ - MoveBlock place-analysis raw response (agent {agent_id}, intention={intention_text!r}): {raw_response!r}")
         try:
             response = clean_json_response(raw_response)
             response = json_repair.loads(response)["place_type"]  # type: ignore
@@ -140,8 +139,10 @@ class MoveBlock(_VendoredMoveBlock):
             get_logger().warning(
                 f"MobilityBlock: Place Analysis: wrong type of place, raw response: {raw_response}"
             )
-            print(f"$DEBUG$ - MoveBlock: place-analysis parse FAILED ({e}), falling back to 'home'. raw={raw_response!r}")
+            print(f"$DEBUG$ - MoveBlock: place-analysis parse FAILED ({e}) for agent {agent_id}, intention={intention_text!r}, falling back to 'home'")
             response = "home"
+        else:
+            print(f"$DEBUG$ - MoveBlock place-analysis (agent {agent_id}, intention={intention_text!r}) -> {response!r}")
 
         # Distrust a home/workplace classification that would otherwise
         # silently no-op (agent's already there) when the step's own words

@@ -476,3 +476,42 @@ a different agent independently sent to the exact same destination moved
 fine. Reads as a simulator-level routing/pathfinding edge case rather than
 anything in the prompt or dispatch logic — not chased further given it's
 1/20 and outside the scope of these fixes.
+
+## Addendum: social-network fix validated; the agent-10-style non-mover recurred (2026-08-22)
+
+Full validation run (20 agents, Bielik, `run.log` captured, 253 plans, no
+crashes) for the social-network seeding fix (`current_changelog.md`'s
+"Fix: agents had no social network at all"). Confirmed: the
+`"No target found in social network"` failure category (283/457, 62% of
+all step failures pre-fix) is now **zero occurrences**; "Contact with
+friends" share of plans dropped 37% -> 17.8%; the corrected
+same-need-repeat rate dropped further, 37.7% -> 17.6%. All three
+gym/grocery/dispatch-bias fixes and the mobility-execution fixes from the
+prior two rounds held steady (mobility gap 11.1%, social-in-person
+conversion 37.8%, shopping in-person 100%) — no regressions.
+
+Two things worth flagging, neither a regression from this session's own
+fixes:
+
+1. **A new-looking `do_chat` failure mode, actually a pre-existing
+   vendored-code fragility that had never been reachable before**: 21
+   failures (`agent/prompt.py`'s `FormatPrompt.format()` choking, most
+   likely on a literal brace character inside a chat message's free text)
+   inside vendored `societyagent.py`'s `do_chat()`. Caught by `do_chat`'s
+   own exception handler (agent silently skips replying to that message),
+   never crashed the run. This only started happening now because agents
+   finally have friends to receive chat messages from — see
+   `current_changelog.md`'s 2026-08-22 entry for detail. Not fixed (would
+   require touching vendored `societyagent.py`/`agent/prompt.py`).
+2. **The "agent 10" simulator-level non-mover pattern recurred** (this
+   run: agent 20, "Commute to school") — dispatch, place-classification,
+   and destination-selection all correct, `PlaceSelectionBlock` picked a
+   real destination, but no position-log entry ever appeared for that
+   agent. Two occurrences across two runs (different agents, same
+   destination-search-succeeds-but-no-visible-move signature) is enough
+   that if it shows up a third time, it's worth tracing into the vendored
+   simulator's `set_aoi_schedules`/pathfinding directly rather than
+   continuing to treat it as a one-off.
+
+See `current_changelog.md`'s 2026-08-22 entry for full numbers and the
+debug-print noise cleanup done alongside this validation.

@@ -194,14 +194,15 @@ class TimeAwareNeedsBlock(_VendoredNeedsBlock):
                 response_format={"type": "json_object"},
                 extra_body={"guided_json": SATISFACTION_SCHEMA},
             )
-            print(f"$DEBUG$ - raw guided_json response for evaluate_and_adjust_needs (attempt {attempt}/{MAX_SCHEMA_RETRIES}): {response!r}")
             try:
                 parsed = json.loads(response)
             except (json.JSONDecodeError, TypeError):
                 parsed = {}
             if all(key in parsed for key in SATISFACTION_KEYS):
                 new_satisfaction = parsed
+                print(f"$DEBUG$ - evaluate_and_adjust_needs: guided_json OK on attempt {attempt}/{MAX_SCHEMA_RETRIES}")
                 break
+            print(f"$DEBUG$ - evaluate_and_adjust_needs: guided_json missing keys on attempt {attempt}/{MAX_SCHEMA_RETRIES}, retrying")
             last_response = response
         else:
             raise ValueError(

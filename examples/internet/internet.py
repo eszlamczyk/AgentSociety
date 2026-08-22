@@ -37,6 +37,7 @@ from metrics.collect import MetricsCollector
 from utils.mobility_block_custom import MobilityBlock as ReliableMobilityBlock
 from utils.other_block_custom import OtherBlock as TimeAwareOtherBlock
 from utils.prompts import TIME_AWARE_SLEEP_PROMPT
+from utils.social_network import seed_social_network
 
 config = Config(
     llm=[
@@ -105,6 +106,9 @@ async def main():
     metrics = None
     try:
         await engine.init()
+
+        citizen_ids = await engine.filter(types=(InternetAgent,))
+        await seed_social_network(engine, citizen_ids, seed=0)
 
         all_pois = engine.environment.map.get_all_pois()
         all_aois = engine.environment.map.get_all_aois()

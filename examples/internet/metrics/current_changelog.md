@@ -606,3 +606,134 @@ recurs across future runs.
 exercise either/or, grocery in-person default) validated — each targeted
 category moved in the expected direction, with the social-in-person number
 in particular jumping from 11.6% to 38%.
+
+## Fix: agents had no social network at all (2026-08-16)
+
+`SocietyAgent.StatusAttributes` (vendored `societyagent.py`) declares
+`social_network` with `default_or_value=[]`, and nothing in
+`examples/internet/` ever populated it — confirmed in code
+(`internet_memory_config.py` never touches it, `internet.py` never seeded
+it) and empirically from the validation run above: **283 of 457 total step
+failures (62%) were `"No target found in social network."` /
+`"Could not find target for message"`** (`social_block.py`'s
+`FindPersonBlock`/`MessageBlock` both bail out immediately when
+`social_network` is empty), the single largest failure category, ahead of
+the "monthly consumption limit" one (155). The knock-on effect: **"Contact
+with friends" made up 37% of all 279 plans that day** (103 plans; one
+agent hit 17/30 = 57% of their whole day) — since the social need can
+never be durably satisfied through an actual relationship, it just keeps
+re-firing. In at least one traced case (agent 10), the plan's
+message-a-friend steps failed outright, yet the LLM's own satisfaction
+evaluator still scored `social_satisfaction: 1.0` for "spending time with
+the friend" — agents narrating a successful hangout over a social graph
+that structurally doesn't exist.
+
+Checked whether any existing code in the repo populates `social_network`
+for the current schema: `examples/rumor_spreader/utils.py`'s
+`initialize_social_network_with_graphs` is the only prior attempt anywhere
+in the repo, but it's dead code (never called from that example's own
+script either) and targets a different, older memory schema (`friends`,
+`relationships` 0–100 scale) that predates the current
+`social_network: list[SocialRelation]` field `social_block.py` actually
+reads (`SocialRelation(target_id, kind: RelationType, strength: 0.0-1.0)`).
+No usable existing pattern to reuse.
+
+**Fix**: new `utils/social_network.py`, `seed_social_network(engine,
+agent_ids, avg_degree=4.0, seed=None)`. Builds an undirected
+Erdos-Renyi-style graph over the agent population (edge probability =
+avg_degree / (n-1)) so it scales sensibly if the agent count changes,
+assigns each edge a kind (55% friend / 30% colleague / 15% family) and a
+kind-appropriate strength (family strongest, colleague weakest, friend
+widest range), writes reciprocal `SocialRelation` entries to both sides of
+each edge via `engine.update([agent_id], "social_network", [...])`, and
+guarantees no agent ends up with zero relations after the random pass.
+Wired into `internet.py`'s `main()`: `citizen_ids =
+await engine.filter(types=(InternetAgent,))` then
+`await seed_social_network(engine, citizen_ids, seed=0)`, called once
+right after `engine.init()` and before the step loop, so every agent's
+social_network is populated before its very first plan of the day.
+
+**Verified** (not yet a full validation run): a smoke test
+(`engine.init()` + `seed_social_network` + directly querying one agent's
+memory) confirmed real `SocialRelation` objects come back correctly
+(e.g. agent 1: `target_id=14, kind=FRIEND, strength=0.82`) — for a
+20-agent population with `avg_degree=4.0`, one run produced 33 relations,
+degree distribution min/median/max = 1/3/6, nobody isolated. A direct
+`FindPersonBlock.forward()` call on the seeded agent hit an unrelated
+`KeyError: position` — an artifact of calling the block before the
+agent's own first tick (which normally sets `position`) ever runs in the
+test harness, not a bug in the seeding itself. **Next step**: a full
+validation run to confirm the 283-failure count and the 37%
+"Contact with friends" share both drop.
+
+## Validation run (2026-08-22, 20 agents, Bielik, social-network fix, `run.log` captured)
+
+Run via `CLEAR_LOGS_ON_START=1 python3 internet.py 2>&1 | tee run.log`
+(253 plans, one simulated day, 288/288 steps completed, no
+tracebacks/crashes).
+
+**Social network fix confirmed**: `"No target found in social network"` /
+`"Could not find target for message"` — 283/457 (62%) of all step
+failures pre-fix — **zero occurrences** in this run's `run.log`.
+"Contact with friends" share of all plans dropped **37% -> 17.8%**
+(45/253), and the corrected same-need-repeat rate (consecutive plans per
+agent) dropped further, **37.7% -> 17.6%** — the unsatisfiable social loop
+was the dominant remaining contributor to that number.
+
+**Everything from the two prior validation rounds held, no regressions**:
+mobility gap 2/18 agents (11.1%, vs. 16%/5% the last two rounds, 68%
+pre-fix); social-in-person mobility conversion 37.8% (vs. 38%);
+shopping/grocery in-person 2/2 (100%, vs. 83%); `guided_json` schema
+evaluation 253/259 calls clean on attempt 1, only 6 needed a retry, zero
+exhausted/crashed; single-failed-step fix still firing correctly
+(`"skipping instead of aborting the plan"` lines present, mostly on the
+"monthly consumption limit" economy case). Gym/workout sample this run
+was too small to read (3 plans, 1 mobility) against the prior round's 13
+plans — not treated as a regression.
+
+**New finding, surfaced by the social-network fix rather than caused by
+it**: 21 `do_chat` failures this run (18x `Error formatting template:
+Single '}' encountered in format string`, 2x `KeyError: 'should_respond'`,
+1x `KeyError: 'fear'`), all inside vendored `societyagent.py`'s
+`do_chat()` -> `agent/prompt.py`'s `FormatPrompt.format()`. Caught safely
+by `do_chat`'s own `except Exception` (agent just doesn't reply to that
+one message — no crash), but this never fired before because agents had
+no friends to receive chat messages from. Most likely trigger: a chat
+message's free-text content containing a literal brace character breaks
+`.format()` when it's embedded into a subsequent template (e.g. the
+emotion-update prompt). Not chased further — it's vendored code
+(`societyagent.py`/`agent/prompt.py`), caught safely, and low-volume
+relative to total messages processed (6534 messages fetched across the
+run). Worth a look if it becomes more disruptive at higher agent counts
+or higher social-network `avg_degree`.
+
+**Non-movers this run (agents 2, 20)**: agent 20's "Commute to school"
+step traced end-to-end in `run.log` — dispatch correct
+(`step_type='mobility' -> MobilityBlock`), place-analysis correctly
+returned `"other"` (not the home/workplace anchoring bug),
+`PlaceSelectionBlock` picked a destination successfully
+(`('Zone', 700001533)`) — then no further debug output and no
+position-log entry for agent 20 all day. Same signature as the "agent 10"
+case from the 2026-08-16 gym/grocery validation run (simulator-level
+routing/pathfinding edge case, not a prompt/dispatch bug) — but this is
+the **second run in a row** it's shown up (different agent, same
+destination-search-succeeds-but-no-visible-move pattern), so if it
+recurs again it's worth actually tracing into the vendored simulator's
+`set_aoi_schedules`/pathfinding rather than continuing to write it off as
+a one-off. Agent 2 never reaches a real mobility step in time — its only
+mobility-flagged plan is its last plan of the day, consistent with the
+already-documented "plan didn't reach its payoff step before sim end"
+pattern, not a new bug.
+
+**Debug print cleanup (2026-08-22)**: the `$DEBUG$` prints in
+`needs_block_custom.py` (raw `guided_json` response text),
+`mobility_block_custom.py` (raw place-analysis response text), and
+`internetagent.py` (full `current_step` dict on the no-`device_usage`
+branch) were dumping full LLM response / step text on every call — the
+dominant source of `run.log` noise. Trimmed to structured, one-line
+summaries (attempt number + outcome, agent id + parsed place-type, step
+intention only) with no free-form text payload. No behavior change —
+same events are logged, just without the raw text blob. The
+`get_logger().warning(...)` call in `mobility_block_custom.py`'s parse-
+failure branch still includes the raw response (goes to the regular log
+file, not stdout spam, and is needed if a parse failure needs debugging).

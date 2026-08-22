@@ -192,7 +192,7 @@ class InternetAgent(SocietyAgent):
             if "device_usage" in current_step:
                 print(f"$DEBUG$ - Device usage field present: {current_step['device_usage']}")
             else:
-                print(f"$DEBUG$ - No device_usage field in step {current_step}")
+                print(f"$DEBUG$ - No device_usage field in step (intention={current_step.get('intention', 'Unknown')!r})")
 
         # Check if current step includes device usage
         if current_step and "device_usage" in current_step and current_step["device_usage"]:
