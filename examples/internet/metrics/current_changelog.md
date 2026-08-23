@@ -4,6 +4,11 @@ Tracks actual code changes made while investigating the findings in
 `findings.md`. See that file for the analysis/root-cause writeup — this
 file is just "what changed and why."
 
+> **Phase 3 marker (2026-08-23)**: project focus has shifted from chasing
+> individual simulation-fidelity bugs to (1) self-hosting the LLM and
+> (2) making sure real agent activity actually produces training-quality
+> logs. See `findings.md`'s "Phase 3" section for the full context.
+
 ## metrics/readable_log.py — show agents with zero movement
 
 `build_timeline()` now unions agent ids from both the position log and the
@@ -737,3 +742,54 @@ same events are logged, just without the raw text blob. The
 `get_logger().warning(...)` call in `mobility_block_custom.py`'s parse-
 failure branch still includes the raw response (goes to the regular log
 file, not stdout spam, and is needed if a parse failure needs debugging).
+
+## utils/social_block_custom.py (new) + internetagent.py — log real chat traffic, not just planned "device_usage" steps (2026-08-23)
+
+Motivation: measured directly on the 100-agent run (`archive/100_agent_social_network_fix_validation_partial/`) — `do_chat` processed **17,810** real
+message deliveries (summed `"Finished fetching pending messages"` counts)
+over 175 steps, but only **408** `device_usage_logs.jsonl` entries were
+tagged `action_type="social"`. Antenna connect/disconnect is driven purely
+by position changes (`InternetAgent.forward()`'s `connect_to_nearest_antenna`
+call), never by message-sending — and the vendored `do_chat`/`MessageBlock`
+never call into `utils/antennas.py` or `log_device_action` at all (confirmed
+by grep — zero references). So ~98% of actual agent-to-agent conversation
+volume left no IP/antenna trace, which matters because this example's stated
+goal (per the old README) is device/IP-based deanonymization graph analysis
+— see the Phase 3 marker below for why this now matters more than before.
+
+- `InternetAgent.do_chat()` (new override, `internetagent.py`): logs a
+  `message_received` network event (own device/IP/antenna + sender's
+  `agent_id` as `peer_id`) on every real incoming social message, for every
+  message regardless of whether the agent decides to respond — mirrors real
+  life (a message arriving is a real network event whether or not you reply)
+  — then delegates to `super().do_chat()` unchanged.
+- `utils/social_block_custom.py` (new): `MessageBlock` subclass wraps the
+  vendored `forward()` — resolves `target` up front (so it's known even when
+  `FindPersonBlock` picks it), calls `super().forward()`, and on success logs
+  a `message_sent` event the same way. `SocialBlock` subclass swaps the
+  vendored `self.message_block` instance for this one in `__init__` and
+  re-registers it with the dispatcher (`BlockDispatcher.register_blocks`
+  keys by class name, so this is a clean overwrite, not a duplicate
+  registration — confirmed by reading `agent/dispatcher.py`).
+- `internetagent.py`'s new `log_message_event()` deliberately does **not**
+  reuse `log_device_action()` — that helper makes an LLM call to pick a
+  "website" for the log entry, which isn't meaningful for a P2P message and
+  would add ~17k extra LLM calls per 100-agent day at message volume.
+  `log_message_event()` goes straight to `log_device_usage()` (the low-level
+  writer) with `website=None` and `action_type="call"`, plus
+  `metadata={"event": "message_sent"|"message_received", "peer_id": ...}`.
+  No message content is logged, by design — real network logs don't have
+  it, and it isn't needed for the deanonymization-graph training-data goal.
+
+**Validation**: 3 escalating smoke tests (2/5/10 agents, up to 30 steps) —
+zero crashes, zero errors from the new code, other blocks (Mobility/Economy/
+Other) continued dispatching normally. At that small scale no test happened
+to land on an actual completed "message" sub-action within the window
+tested (low probability at 5-10 agents over a few hours), so the write path
+itself (`log_message_event` → `log_device_usage` → `device_usage_logs.jsonl`
+with the new `metadata.event`/`metadata.peer_id` fields) has not yet been
+observed firing on a live run — only that nothing broke. The next full
+100-agent run should confirm within its first few minutes given the message
+volume above; worth checking `device_usage_logs.jsonl` for `action_type:
+"call"` entries with a `metadata.event` field early rather than walking away
+for the full ~2.5h.

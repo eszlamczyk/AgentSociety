@@ -1,7 +1,11 @@
 import asyncio
 import inspect
 import copy
+import os
 import time
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import agentsociety.vectorstore.vectorstore as _vs
 _vs_source = inspect.getsourcefile(_vs.VectorStore)
@@ -16,7 +20,7 @@ from agentsociety.cityagent import default, DEFAULT_DISTRIBUTIONS
 from agentsociety.cityagent.blocks.economy_block import EconomyBlock, EconomyBlockParams
 from agentsociety.cityagent.blocks.mobility_block import MobilityBlockParams
 from agentsociety.cityagent.blocks.other_block import OtherBlockParams
-from agentsociety.cityagent.blocks.social_block import SocialBlock, SocialBlockParams
+from agentsociety.cityagent.blocks.social_block import SocialBlockParams
 from agentsociety.configs import (
     AgentsConfig,
     Config,
@@ -36,6 +40,7 @@ from internet_memory_config import memory_config_internetagent
 from metrics.collect import MetricsCollector
 from utils.mobility_block_custom import MobilityBlock as ReliableMobilityBlock
 from utils.other_block_custom import OtherBlock as TimeAwareOtherBlock
+from utils.social_block_custom import SocialBlock as NetworkAwareSocialBlock
 from utils.prompts import TIME_AWARE_SLEEP_PROMPT
 from utils.social_network import seed_social_network
 
@@ -44,7 +49,7 @@ config = Config(
         LLMConfig(
             provider=LLMProviderType.PLGrid,
             base_url = None,
-            api_key="plg-BWGsh-yoy80SV0w16cDpND01lW0evlBRx1qknt7CDKk",
+            api_key=os.environ["PLGRID_API_KEY"],
             model="speakleash/Bielik-11B-v3.0-Instruct",
             concurrency=2000,
             timeout = 60
@@ -64,13 +69,13 @@ config = Config(
         citizens=[
             AgentConfig(
                 agent_class=InternetAgent,
-                number=20,
+                number=100,
                 memory_config_func=memory_config_internetagent,
                 memory_distributions=copy.deepcopy(DEFAULT_DISTRIBUTIONS),
                 blocks={
                     ReliableMobilityBlock: MobilityBlockParams(),
                     EconomyBlock: EconomyBlockParams(),
-                    SocialBlock: SocialBlockParams(),
+                    NetworkAwareSocialBlock: SocialBlockParams(),
                     TimeAwareOtherBlock: OtherBlockParams(
                         sleep_time_estimation_prompt=TIME_AWARE_SLEEP_PROMPT
                     ),
@@ -79,7 +84,7 @@ config = Config(
         ]
     ),  # type: ignore
     exp=ExpConfig(
-        name="control group - 20 agents full day",
+        name="control group - 100 agents full day",
         workflow=[
             WorkflowStepConfig(
                 type=WorkflowType.STEP,
@@ -115,7 +120,7 @@ async def main():
         aois_with_pois = [a for a in all_aois if len(a["poi_ids"]) > 0]
         print(f"[map] POIs: {len(all_pois)}, AOIs: {len(all_aois)}, AOIs with POIs: {len(aois_with_pois)}")
 
-        metrics = MetricsCollector(out_dir="metrics/output/20_agent_fullday_controll")
+        metrics = MetricsCollector(out_dir="metrics/output/100_agent_fullday_controll")
 
         for step in range(N_STEPS):
             day, tick = engine.environment.get_datetime()

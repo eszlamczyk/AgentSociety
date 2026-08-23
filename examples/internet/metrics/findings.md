@@ -515,3 +515,115 @@ fixes:
 
 See `current_changelog.md`'s 2026-08-22 entry for full numbers and the
 debug-print noise cleanup done alongside this validation.
+
+## Addendum: 100-agent run — fixes hold at 5x scale, one new crash, and the messaging/antenna gap (2026-08-23)
+
+First 100-agent full-day attempt on Bielik since the fix series above (all
+data in `archive/100_agent_social_network_fix_validation_partial/` —
+partial because the run crashed at step 175/288, ~61% of the simulated
+day, tick=73801/day0 ≈20:30).
+
+**All prior fixes hold at 5x the population tested so far**:
+
+| metric | 20-agent validation | 100-agent (partial) | read |
+|---|---|---|---|
+| mobility gap | 5-16% | 5.7% (5/88) | holds |
+| same-need-repeat rate | 17.6% | 18.3% (139/758 consecutive pairs) | holds |
+| "No target found in social network" failures | 0 | 0 (across 858 plans) | holds |
+| single-step-abort fix firing | present | 576 occurrences | still working |
+
+86/100 agents produced ≥1 position-log entry. 858 plans logged; top targets
+Contact with friends (164), Eat at home (135), Work (72), Sleep at home
+(66), Leisure/entertainment (62) — no degenerate skew. Behavioral plots at
+`archive/100_agent_social_network_fix_validation_partial/plots/`.
+
+**New crash, distinct from the "agent 10/20" non-mover pattern**: a single,
+clean, unhandled crash — the vendored city simulator's `GetPerson` RPC
+returned `None` for some agent mid-tick, and an unguarded
+`MessageToDict(None)` call in vendored `environment/utils/protobuf.py:42`
+raised `AttributeError: 'NoneType' object has no attribute 'DESCRIPTOR'`,
+propagated up through `agent.py:149`'s `update_motion()` as an unhandled
+`RuntimeError`, killing the whole process
+(`simulationengine.py:1684`). Only one occurrence in this run (not a
+repeating failure once it happens) — smells related to the "agent 10/20"
+silent-non-mover pattern (same underlying simulator routing/state area) but
+manifests as a hard crash instead of a silent no-op, plausibly worse at
+5x population density. Not yet root-caused or fixed — `internet.py`'s main
+loop has no retry/resilience around `engine.step()`, so any future
+recurrence kills the whole run again.
+
+**Investigated: does communicating trigger antenna pings? No.** Antenna
+connect/disconnect (`InternetAgent.forward()`'s `connect_to_nearest_antenna`
+call) is driven entirely by physical position changes, checked every tick
+regardless of activity. The real chat mechanism (vendored
+`do_chat`/`SocialBlock`/`MessageBlock`) never touches
+`utils/antennas.py`/`log_device_action` at all (confirmed by grep — zero
+references). Measured: **17,810** real message deliveries in this run vs.
+only **408** `device_usage_logs.jsonl` entries tagged `action_type="social"`
+— roughly **98% of actual agent-to-agent conversation volume left no
+IP/antenna trace**, since that log only fires when a plan step's
+LLM-generated JSON happens to carry a `device_usage` field, independent of
+whether real messages were actually exchanged. Fixed in
+`current_changelog.md`'s 2026-08-23 entry (`utils/social_block_custom.py` +
+`InternetAgent.do_chat()` override) — not yet confirmed firing on a live
+run at the time of writing, see that entry's validation note.
+
+**Investigated: the do_chat "Hey!/hey!" repetition loop (2026-08-23)** —
+follow-up to earlier speculation about conversation context. Measured
+directly from this run's 17,762 real `do_chat` decision prompts, simulating
+the code's actual `[-200:]` truncation (`societyagent.py:567`): the LLM-
+visible window averages only **5.6 turns** (min 1, max 12) — small enough
+that spotting a repeated greeting should be trivial. Yet **35.5% of prompts
+(6,309) already contain a repeated message within that same visible
+window**, and the model still responds with essentially the same line
+again (e.g. a captured window: `"...he/she: Looking forward to it! 🚀，me:
+Looking forward to our chat! 🚀，he/she: Looking forward to it! 🚀"` — the
+model then replied with another near-identical line). **Conclusion: not a
+context-visibility bug** — the repetition is directly visible in the
+prompt — but Bielik-11B failing to act on the prompt's own instruction #2
+("if the conversation should end, don't respond / say goodbye"). Same
+prompt's instruction #5 (responses under 20 characters) is also routinely
+violated — general weak instruction-following, not specific to this one
+instruction. Not fixed (would require either patching vendored
+`societyagent.py:do_chat` or adding repetition-detection in `InternetAgent`
+before the prompt is built) — flagged as a candidate for Phase 3 below,
+not chased further this session.
+
+## Phase 3: self-hosted LLM + training-data-quality logs (2026-08-23)
+
+Project focus is shifting. Phases 1-2 (the fix series above) were about
+making the simulated population *behave* plausibly — movement, need
+satisfaction, social contact all now hold up under validation at 5x scale.
+Phase 3 is about two different things:
+
+1. **Getting off the slow/costly remote Bielik endpoint onto self-hosted
+   inference.** A PLGrid/Cyfronet Athena grant is the leading candidate
+   (384 A100s, and notably the machine Bielik itself was trained on).
+   Cost/throughput modeling done so far (not repeated here) suggests one
+   A100 running vLLM is plausibly sufficient for 100+ agents — the current
+   remote endpoint's slowness looks like a serial-dispatch/rate-limit
+   bottleneck, not a raw-compute one (the 100-agent run averaged *faster*
+   per-step than the 20-agent run despite 5x the agents). Athena's GPU
+   partitions cap job walltime (12-24h), so any implementation needs
+   job-chaining, not a single long-running job.
+2. **Making sure realistic activity actually produces logs suitable for
+   training a graph neural network to re-identify people across movement**
+   — the actual end goal of this whole example, not a side effect of it.
+   This reframes what "the simulation is working" means: it's no longer
+   enough for an agent's *behavior* to look plausible (Phase 1-2's bar) —
+   every real network-layer event (message sent/received, device used,
+   antenna/IP session) needs to leave a trace of the kind a real
+   deanonymization pipeline would have to work from. The 98%-invisible
+   messaging gap found in this addendum is exactly the kind of problem this
+   phase is watching for — plausible-looking agent behavior that quietly
+   fails to produce the training data it's supposed to generate. Message
+   *content* is explicitly out of scope for these logs (real network logs
+   don't have it either) — only IP/antenna/device/timing/peer-identity
+   metadata matters.
+
+Open items flagged above that are now Phase 3-relevant rather than Phase
+1-2 bugs: the do_chat repetition loop (doesn't block training-data
+generation, but repetitive/degenerate conversations may reduce the realism
+of *timing* patterns a GNN would learn from), and the `GetPerson`-returns-
+`None` crash (directly blocks generating any long/large training run until
+addressed — highest-priority open item).

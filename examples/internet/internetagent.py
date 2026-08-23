@@ -547,6 +547,61 @@ Website:"""
         else:
             print(f"$DEVICE$ - {self.name} used {device.name} to: {action_description}")
 
+    async def log_message_event(self, event: str, peer_id: int, action_description: str):
+        """
+        Log a network-layer event for an actual chat message send/receive.
+
+        Unlike log_device_action, this fires on every real do_chat/MessageBlock
+        exchange regardless of whether the planning LLM happened to attach a
+        device_usage field to the step, and skips the LLM-based website
+        selection (not meaningful for a peer-to-peer message) so it stays cheap
+        at message volume. Mirrors a real call-detail record: own device/IP/
+        antenna plus the peer's agent_id, no message content.
+        """
+        if not self.connected_antenna and not self.home_leased_ips:
+            print(f"$DEVICE$ - {self.name} {event} with no internet connection (unlogged)")
+            return
+
+        device = self._select_device_for_task("call")
+        if not device or device.device_type.value == "none":
+            return
+
+        device_id = f"{self.id}_{device.device_type.value}"
+        ip_address = self._get_current_ip(device_id)
+        sim_day, sim_time = self.environment.get_datetime(format_time=True)
+
+        log_device_usage(
+            agent_id=self.id,
+            agent_name=self.name,
+            device_id=device_id,
+            device_type=device.device_type.value,
+            device_name=device.name,
+            browser_id=None,
+            action_type="call",
+            action_description=action_description,
+            task_target=None,
+            success=True,
+            metadata={"event": event, "peer_id": peer_id},
+            website=None,
+            ip_address=ip_address,
+            sim_time=f"day{sim_day} {sim_time}",
+        )
+        print(f"$DEVICE$ - {self.name} {event} (peer={peer_id}) via {device.name}")
+
+    async def do_chat(self, message) -> str:
+        """Log the real network event for an incoming chat message, then defer
+        to the vendored reply-generation logic unchanged."""
+        payload = getattr(message, "payload", {}) or {}
+        if payload.get("type", "social") == "social":
+            sender_id = message.from_id
+            if sender_id:
+                await self.log_message_event(
+                    event="message_received",
+                    peer_id=sender_id,
+                    action_description="Received a chat message",
+                )
+        return await super().do_chat(message)
+
     def _get_current_ip(self, device_id: str):
         """Return the current IP address for a device, or None if unavailable."""
         if device_id in self.home_leased_ips:
