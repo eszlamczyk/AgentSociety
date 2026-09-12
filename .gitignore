@@ -27,3 +27,8 @@ agentsociety-ui
 agentsociety_data/
 .agentsociety-benchmark/
 venv
+
+# Large run artifacts from examples/internet validation runs — keep out of git,
+# GitHub rejects blobs >100MB and these regularly exceed it.
+examples/internet/archive/**/run.log
+examples/internet/**/run.log
