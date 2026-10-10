@@ -3,6 +3,7 @@ import logging
 import random
 import datetime
 import math
+import traceback
 
 from agentsociety.agent import CitizenAgentBase
 from agentsociety.cityagent import SocietyAgent
@@ -13,6 +14,8 @@ from utils.prompts import CUSTOM_DETAILED_PLAN_PROMPT, CUSTOM_BLOCK_DISPATCH_PRO
 from utils.ict_devices import assign_devices_to_agent, get_device_awareness_text, ICTDevice
 from utils.device_logger import log_device_usage, log_internet_browsing, log_position_change
 from utils.needs_block_custom import TimeAwareNeedsBlock
+from utils import guardrails
+from agentsociety.logger import get_logger
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +265,71 @@ class InternetAgent(SocietyAgent):
                     await self.memory.status.update("current_plan", current_plan)
         return await super().check_and_update_step()
 
+    async def run(self):
+        """Override: one agent's unhandled exception costs that agent one tick, not everyone the day.
+
+        `simulationengine.py`'s `step()` runs every agent's `run()` inside a
+        single `asyncio.gather(*tasks)` and re-raises any exception as a bare
+        `RuntimeError`, which aborts the whole simulation. There is no
+        per-agent isolation in the vendored engine. Weak models (Bielik-11B)
+        produce malformed shapes often enough that any parse site without its
+        own fallback is a run-killer, and the GetPerson RPC crash that ended
+        the 2026-08-23 100-agent run at step 175/288 showed non-LLM failures
+        do the same.
+
+        Catches `Exception` only: `asyncio.CancelledError` is a `BaseException`
+        and still propagates, so engine shutdown is unaffected. Returns 0.0
+        (the vendored `run()` returns elapsed seconds, consumed only by
+        `Logs.agent_time_log`). The traceback goes to the agentsociety logger
+        at ERROR so it lands in `run.log` with a timestamp, and the firing is
+        counted under `agent_tick_exception` in `guardrails.csv`.
+        """
+        try:
+            return await super().run()
+        except Exception:
+            guardrails.bump("agent_tick_exception")
+            get_logger().error(
+                f"{self.name}: tick aborted by unhandled exception — skipping this agent for this step only\n"
+                + traceback.format_exc()
+            )
+            return 0.0
+
+    async def update_motion(self):
+        """Override: don't let one bad GetPerson RPC response kill the entire run.
+
+        Vendored `Agent.update_motion()` (agent.py) calls
+        `self.environment.get_person(self.id)`, which round-trips through the
+        city simulator's `GetPerson` RPC and `protobuf.py`'s `async_parse`.
+        Confirmed via a 100-agent run's traceback (archived in
+        `archive/100_agent_social_network_fix_validation_partial/run.log`):
+        the RPC occasionally returns `None` for a given agent mid-tick, and
+        `MessageToDict(None)` raises `AttributeError: 'NoneType' object has no
+        attribute 'DESCRIPTOR'`. Every agent's `before_forward()` runs inside
+        one shared `asyncio.gather(*tasks)` in `simulationengine.py`'s
+        `step()`, so this one agent's bad RPC response was enough to kill the
+        whole step (re-raised there as a bare `RuntimeError`) and abort the
+        entire simulation — the run died at step 175/288, ~61% through the
+        simulated day.
+
+        Since the crash happens *inside* `environment.get_person()` before it
+        returns, there's no return value to sanity-check — we just catch the
+        failure and skip this tick's motion update for this agent only,
+        leaving `self.status`'s existing position/motion fields as they were.
+        A single missed motion refresh is a rounding error next to losing the
+        rest of the simulated day.
+        """
+        if self.environment is None:
+            raise ValueError("Environment is not initialized")
+        try:
+            resp = await self.environment.get_person(self.id)
+        except Exception as e:
+            guardrails.bump("get_person_rpc_failed")
+            print(f"$DEBUG$ - {self.name}: update_motion() GetPerson call failed ({e!r}) — skipping this tick's motion update")
+            return
+        resp_dict = resp["person"]
+        for k, v in resp_dict.get("motion", {}).items():
+            await self.status.update(k, v, mode="replace")
+
     async def plan_generation(self):
         """Override to stash start-of-plan context onto the plan itself.
 
@@ -453,7 +521,8 @@ Website:"""
             
         except Exception as e:
             print(f"$DEVICE$ - Failed to get LLM website selection: {e}")
-        
+
+        guardrails.bump("website_selection_fallback")
         # Fallback defaults — respect action_type first, then keywords
         type_fallbacks = {
             "work":   "outlook.com",

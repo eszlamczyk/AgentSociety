@@ -1,9 +1,13 @@
 """
 MetricsCollector — call record() once after each simulation step.
 
-Writes two CSV files incrementally (one row per step / per agent-step):
-  - steps.csv   : step, tick, wall_time_s, input_tokens, output_tokens
-  - agents.csv  : step, agent_id, input_tokens, output_tokens
+Writes three CSV files incrementally:
+  - steps.csv      : one row per step — tick, wall time, tokens, LLM transport
+                     error counts, and guardrail_firings (total fallbacks that
+                     step, see utils/guardrails.py)
+  - agents.csv     : one row per agent-step — tokens and error counts
+  - guardrails.csv : long-format (step, guardrail, count), one row per
+                     guardrail name that fired that step; absent names = 0
 """
 
 import csv
@@ -11,7 +15,9 @@ from pathlib import Path
 
 
 _STEPS_HEADER = ["step", "tick", "wall_time_s", "input_tokens", "output_tokens",
-                 "total_errors", "connection_errors", "openai_errors", "timeout_errors", "other_errors"]
+                 "total_errors", "connection_errors", "openai_errors", "timeout_errors", "other_errors",
+                 "guardrail_firings"]
+_GUARDRAILS_HEADER = ["step", "guardrail", "count"]
 _AGENTS_HEADER = ["step", "agent_id", "input_tokens", "output_tokens",
                   "total_errors", "connection_errors", "openai_errors", "timeout_errors", "other_errors"]
 
@@ -27,22 +33,28 @@ class MetricsCollector:
 
         self._steps_path = out_dir / "steps.csv"
         self._agents_path = out_dir / "agents.csv"
+        self._guardrails_path = out_dir / "guardrails.csv"
 
         # Open for append — write header only if file is new/empty.
         self._steps_f = open(self._steps_path, "a", newline="")
         self._agents_f = open(self._agents_path, "a", newline="")
+        self._guardrails_f = open(self._guardrails_path, "a", newline="")
 
         self._steps_w = csv.writer(self._steps_f)
         self._agents_w = csv.writer(self._agents_f)
+        self._guardrails_w = csv.writer(self._guardrails_f)
 
         if self._steps_path.stat().st_size == 0:
             self._steps_w.writerow(_STEPS_HEADER)
         if self._agents_path.stat().st_size == 0:
             self._agents_w.writerow(_AGENTS_HEADER)
+        if self._guardrails_path.stat().st_size == 0:
+            self._guardrails_w.writerow(_GUARDRAILS_HEADER)
 
         self._step_counter = 0
 
-    def record(self, tick: int, wall_time_s: float, llm_log: list) -> None:
+    def record(self, tick: int, wall_time_s: float, llm_log: list,
+               guardrails: dict[str, int] | None = None) -> None:
         """
         Aggregate the llm_log from this step and write one row to each CSV.
 
@@ -52,7 +64,11 @@ class MetricsCollector:
             llm_log:     The Logs.llm_log list returned by engine.step().
                          Each entry is a dict with keys: agent_id, input_tokens,
                          output_tokens, request_time, consumption, ...
+            guardrails:  {guardrail_name: firings} for this step, as returned
+                         by utils.guardrails.snapshot_and_reset(). Optional.
         """
+        guardrails = guardrails or {}
+        guardrail_total = sum(guardrails.values())
         # --- per-step totals ---
         total_in = sum(e["input_tokens"] for e in llm_log)
         total_out = sum(e["output_tokens"] for e in llm_log)
@@ -64,9 +80,15 @@ class MetricsCollector:
 
         self._steps_w.writerow(
             [self._step_counter, tick, round(wall_time_s, 4), total_in, total_out,
-             total_errors, conn_errors, oai_errors, timeout_errors, other_errors]
+             total_errors, conn_errors, oai_errors, timeout_errors, other_errors,
+             guardrail_total]
         )
         self._steps_f.flush()
+
+        # --- guardrail firings (long format; only names that fired) ---
+        for name in sorted(guardrails):
+            self._guardrails_w.writerow([self._step_counter, name, guardrails[name]])
+        self._guardrails_f.flush()
 
         # --- per-agent breakdown ---
         # agent_id=None means a call made outside any agent context (e.g. init).
@@ -99,3 +121,4 @@ class MetricsCollector:
     def close(self) -> None:
         self._steps_f.close()
         self._agents_f.close()
+        self._guardrails_f.close()

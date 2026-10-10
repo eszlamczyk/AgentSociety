@@ -793,3 +793,78 @@ observed firing on a live run — only that nothing broke. The next full
 volume above; worth checking `device_usage_logs.jsonl` for `action_type:
 "call"` entries with a `metadata.event` field early rather than walking away
 for the full ~2.5h.
+
+## Robustness guardrails: one agent's failure no longer costs the whole day (2026-10-10)
+
+Context: the 2026-08-23 100-agent run died at step 175/288 on a single
+agent's `GetPerson` RPC returning `None`, and the 2026-09-20 run produced no
+data at all (expired PLGrid key, every call 401). Separately, the custom
+satisfaction evaluator *raised* after 3 bad `guided_json` shapes — never hit
+in practice (worst observed: 1 failure at attempt 2 of 3, 858 evaluations),
+but one bad streak away from aborting a multi-hour run. `simulationengine.py`'s
+`step()` gathers all agents and re-raises any exception as `RuntimeError`, so
+there was no per-agent isolation anywhere. Four changes, all local to
+`examples/internet/`:
+
+### internetagent.py — `InternetAgent.run()` per-agent catch-all
+
+Wraps the vendored `run()`; on any `Exception` logs the traceback at ERROR
+(so it lands in `run.log` with a timestamp), counts it as
+`agent_tick_exception`, and returns `0.0` (the vendored return value is
+elapsed seconds, only consumed by `Logs.agent_time_log`). One agent loses one
+tick; everyone else continues. `asyncio.CancelledError` is a `BaseException`
+and still propagates, so shutdown is unaffected. This is the backstop for
+every crash we haven't seen yet — the `update_motion()` override from
+2026-09 still handles the known GetPerson case specifically (and now counts
+it as `get_person_rpc_failed`).
+
+### utils/needs_block_custom.py — degrade, don't raise, on schema exhaustion
+
+If all `MAX_SCHEMA_RETRIES` (3) attempts come back missing keys: ERROR log,
+`satisfaction_eval_exhausted` counter, and the four satisfaction values are
+left **unchanged** for this plan (no guessing). Each failed attempt counts as
+`satisfaction_eval_retry`. Also hardened the accept path: a non-dict JSON
+response is treated as a bad shape, each value is `float()`-coerced and
+clamped to [0, 1], and a non-numeric value is skipped individually (counted
+as `satisfaction_eval_bad_value`, logged at ERROR) rather than crashing.
+Plan logging (`log_plan_generated`) still fires in every case with whatever
+the values actually are, so `plan_logs.jsonl` stays truthful. Verified with
+a fake LLM: exhaustion / retry-then-success / clamp / bad-value paths.
+
+### utils/guardrails.py (new) + metrics/collect.py — count every rescue
+
+Every fallback site now calls `guardrails.bump(<name>)`; `internet.py` drains
+the counters each step and `MetricsCollector` writes them to a new
+long-format `metrics_output/guardrails.csv` (`step,guardrail,count`) plus a
+`guardrail_firings` total column appended to `steps.csv`. Vendored blocks'
+own silent fallbacks (random POI category, default 10 km radius, plan parse
+failures, social-block errors, ...) are counted too, via a `logging.Filter`
+on the `agentsociety` logger that matches their warning-message prefixes —
+no vendored code touched. The filter never suppresses anything. Caveat: it
+only sees records at the logger's level or above, so the run must keep
+`logging_level="info"` (it does). The 2026-08-23 run would have shown 53
+mobility fallbacks and 17 evaluator retries — invisible in every plot until
+now. `internet.py` also prints a per-run total at exit.
+
+### run_fullday.sh — plot on partial failure; metrics/guardrail_analysis.py (new)
+
+The script no longer aborts before plotting when `internet.py` exits
+non-zero: it reports the status, generates every plot it can from the
+partial logs (each plot script failure is reported and skipped, not fatal),
+then exits with the *simulation's* status. New
+`metrics/guardrail_analysis.py` draws `guardrail_firings_by_step.png`
+(stacked per step, fixed colour per guardrail name across runs) and
+`guardrail_totals.png`; it no-ops cleanly on runs that predate
+`guardrails.csv`. Verified by stubbing the simulation with `exit 3`.
+
+### Housekeeping
+
+Removed `logs/2026-09-20/` (zero-data run: expired key, 0 steps completed).
+`archive/100_agent_social_network_fix_validation_partial/` was deliberately
+kept — it is the current "after" side of the Bielik before/after comparison
+until a complete 100-agent run replaces it.
+
+**Not yet verified against a live simulation** (no valid PLGrid key at the
+time of writing). `py_compile` + `import internet` pass; the catch-all,
+evaluator, counters, CSV writer, plot script and shell script were each
+exercised in isolation.

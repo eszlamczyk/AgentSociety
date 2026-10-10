@@ -67,7 +67,9 @@ is inherited unchanged from the vendored NeedsBlock.
 import json
 
 from agentsociety.cityagent.blocks.needs_block import NeedsBlock as _VendoredNeedsBlock
+from agentsociety.logger import get_logger
 
+from utils import guardrails
 from utils.plan_logger import log_plan_generated
 
 SATISFACTION_KEYS = (
@@ -81,7 +83,11 @@ SATISFACTION_KEYS = (
 # guided_json — observed responses included an extra unrequested key and,
 # separately, a bare `{}`. Extra keys are harmless (we only ever read
 # SATISFACTION_KEYS below); a response missing required keys gets re-asked
-# up to this many times before we give up and raise loudly.
+# up to this many times. If every attempt comes back short we log an ERROR,
+# count it under `satisfaction_eval_exhausted` in guardrails.csv, and leave
+# the four satisfaction values untouched for this plan — a visible, counted
+# degradation rather than a crash of the whole run (see the per-agent
+# catch-all in internetagent.py for why one raise used to cost the day).
 MAX_SCHEMA_RETRIES = 3
 
 SATISFACTION_SCHEMA = {
@@ -183,9 +189,9 @@ class TimeAwareNeedsBlock(_VendoredNeedsBlock):
         # failure mode: the backend not honoring guided_json's required-keys
         # constraint (missing keys, e.g. a bare `{}`). We re-ask up to
         # MAX_SCHEMA_RETRIES times; extra/unrequested keys are fine as-is
-        # since only SATISFACTION_KEYS are ever read. Still no silent
-        # accept-and-move-on: if every attempt comes back short, this raises
-        # visibly rather than treating missing data as "no change".
+        # since only SATISFACTION_KEYS are ever read. No silent
+        # accept-and-move-on: exhaustion is logged at ERROR and counted, and
+        # the values are deliberately left unchanged rather than guessed.
         new_satisfaction = None
         last_response = None
         for attempt in range(1, MAX_SCHEMA_RETRIES + 1):
@@ -198,20 +204,34 @@ class TimeAwareNeedsBlock(_VendoredNeedsBlock):
                 parsed = json.loads(response)
             except (json.JSONDecodeError, TypeError):
                 parsed = {}
-            if all(key in parsed for key in SATISFACTION_KEYS):
+            if isinstance(parsed, dict) and all(key in parsed for key in SATISFACTION_KEYS):
                 new_satisfaction = parsed
                 print(f"$DEBUG$ - evaluate_and_adjust_needs: guided_json OK on attempt {attempt}/{MAX_SCHEMA_RETRIES}")
                 break
+            guardrails.bump("satisfaction_eval_retry")
             print(f"$DEBUG$ - evaluate_and_adjust_needs: guided_json missing keys on attempt {attempt}/{MAX_SCHEMA_RETRIES}, retrying")
             last_response = response
         else:
-            raise ValueError(
+            guardrails.bump("satisfaction_eval_exhausted")
+            get_logger().error(
                 f"evaluate_and_adjust_needs: guided_json response missing required "
-                f"keys after {MAX_SCHEMA_RETRIES} attempts; last response: {last_response!r}"
+                f"keys after {MAX_SCHEMA_RETRIES} attempts; leaving satisfaction "
+                f"unchanged for plan {completed_plan.get('target')!r}; "
+                f"last response: {last_response!r}"
             )
 
-        for key in SATISFACTION_KEYS:
-            await self.memory.status.update(key, new_satisfaction[key])
+        if new_satisfaction is not None:
+            for key in SATISFACTION_KEYS:
+                try:
+                    value = float(new_satisfaction[key])
+                except (TypeError, ValueError):
+                    guardrails.bump("satisfaction_eval_bad_value")
+                    get_logger().error(
+                        f"evaluate_and_adjust_needs: non-numeric {key}={new_satisfaction[key]!r}; "
+                        f"leaving it unchanged"
+                    )
+                    continue
+                await self.memory.status.update(key, min(1.0, max(0.0, value)))
 
         # Log this plan's own outcome now that it's known, attributed to the
         # plan itself (its own start time/steps/target/emotion, stashed by

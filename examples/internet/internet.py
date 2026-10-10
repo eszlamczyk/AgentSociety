@@ -38,6 +38,7 @@ from agentsociety.storage import DatabaseConfig
 from internetagent import InternetAgent, START_WEEKDAY
 from internet_memory_config import memory_config_internetagent
 from metrics.collect import MetricsCollector
+from utils import guardrails
 from utils.mobility_block_custom import MobilityBlock as ReliableMobilityBlock
 from utils.other_block_custom import OtherBlock as TimeAwareOtherBlock
 from utils.social_block_custom import SocialBlock as NetworkAwareSocialBlock
@@ -107,6 +108,11 @@ N_STEPS = 288             # 288 * 5min = 24hr
 
 
 async def main():
+    # Count the vendored blocks' own fallback warnings (random POI category,
+    # plan parse failures, ...) alongside our explicit guardrail bumps — see
+    # utils/guardrails.py. Must be installed before any block logs anything.
+    guardrails.install_log_counter()
+
     engine = AgentSociety.create(config)
     metrics = None
     try:
@@ -120,7 +126,7 @@ async def main():
         aois_with_pois = [a for a in all_aois if len(a["poi_ids"]) > 0]
         print(f"[map] POIs: {len(all_pois)}, AOIs: {len(all_aois)}, AOIs with POIs: {len(aois_with_pois)}")
 
-        metrics = MetricsCollector(out_dir="metrics/output/100_agent_fullday_controll")
+        metrics = MetricsCollector(out_dir=os.environ.get("METRICS_OUT_DIR", "metrics/output/100_agent_fullday_controll"))
 
         for step in range(N_STEPS):
             day, tick = engine.environment.get_datetime()
@@ -128,12 +134,21 @@ async def main():
             logs = await engine.step(TICKS_PER_STEP)
             wall = time.perf_counter() - t0
 
-            metrics.record(tick=tick, wall_time_s=wall, llm_log=logs.llm_log)
-            print(f"[step {step+1}/{N_STEPS}] tick={tick} wall={wall:.1f}s")
+            fired = guardrails.snapshot_and_reset()
+            metrics.record(tick=tick, wall_time_s=wall, llm_log=logs.llm_log, guardrails=fired)
+            fired_note = f" guardrails={sum(fired.values())}" if fired else ""
+            print(f"[step {step+1}/{N_STEPS}] tick={tick} wall={wall:.1f}s{fired_note}")
 
     finally:
         if metrics is not None:
             metrics.close()
+        totals = guardrails.totals()
+        if totals:
+            print("[guardrails] total firings this run: " + ", ".join(
+                f"{name}={count}" for name, count in sorted(totals.items(), key=lambda kv: -kv[1])
+            ))
+        else:
+            print("[guardrails] no guardrail fired this run")
         await engine.close()
 
 

@@ -68,6 +68,8 @@ from agentsociety.cityagent.blocks.mobility_block import (
 from agentsociety.cityagent.blocks.utils import clean_json_response
 from agentsociety.logger import get_logger
 
+from utils import guardrails
+
 # Same shape as the vendored PLACE_ANALYSIS_PROMPT, but with three balanced
 # worked examples instead of one ({"place_type": "home"}) — that single
 # example anchors weaker models toward answering "home" for anything
@@ -136,6 +138,7 @@ class MoveBlock(_VendoredMoveBlock):
             response = clean_json_response(raw_response)
             response = json_repair.loads(response)["place_type"]  # type: ignore
         except Exception as e:
+            guardrails.bump("mobility_place_analysis_parse_fallback")
             get_logger().warning(
                 f"MobilityBlock: Place Analysis: wrong type of place, raw response: {raw_response}"
             )
