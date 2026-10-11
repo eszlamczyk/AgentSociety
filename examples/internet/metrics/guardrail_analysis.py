@@ -56,6 +56,7 @@ _PRIORITY = [
     "vendored_mobility_radius_default",
     "other_duration_random",
     "website_selection_fallback",
+    "chat_decision_parse_fallback",
 ]
 
 

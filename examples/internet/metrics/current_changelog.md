@@ -444,6 +444,14 @@ this time — see "Known issues" below). Results, full detail in
 
 ## Known issues / next todos
 
+- **Fix / investigate sleep** (added 2026-10-11, see "Sleep-by-hour
+  comparison added" below). The 2026-10-10 full run still has the daytime
+  nap from findings.md #3: 20-27 of 100 agents in a sleep plan from 13:00
+  to 17:00, as many as at night, and only ~a quarter of agents asleep at
+  night at all. 109/113 sleep plans were `need="tired"`. Working hypothesis
+  (not yet tested): energy decay is too steep and the energy gained from
+  sleeping is too small, so agents hit "tired" mid-afternoon and never
+  recover enough overnight. Parked for now.
 - **`readable_plan_log.py`'s `[SAME NEED REPEATED]` flag is now
   tautological** (`need_before == need` always true post-fix — see the
   stale-snapshot fix above). Needs to be changed to compare each plan's
@@ -868,3 +876,167 @@ until a complete 100-agent run replaces it.
 time of writing). `py_compile` + `import internet` pass; the catch-all,
 evaluator, counters, CSV writer, plot script and shell script were each
 exercised in isolation.
+
+## Chat loop: let the model end conversations, cap the rest, mute the transcript spam (2026-10-10)
+
+Diagnosis of the paused 2026-10-10 100-agent run (143/288 steps, 5.65 h):
+not the 6,000 tok/s cap (achieved median 1,943 tok/s, best 3,258) and not a
+regression (the 2026-08-23 run had the identical profile: 93 s median / 140 s
+mean per step, 49% of all tokens on do_chat). The cost is conversations that
+never end. 257 plan-driven "send a message" steps produced 12,136 received
+messages; 189 distinct conversations, median 113 turns, max 375; ~80 live
+pairs by step 108, each costing both sides one do_chat LLM call (plus a
+cognition `emotion_update` call) per tick — 60-66% of tokens from
+mid-afternoon on. Steps at ~240 s vs ~95 s are explained by the engine's
+message dispatch processing each agent's inbox *serially*: one agent with 7-8
+queued messages = ~190 s of the step. Bielik was already saying goodbye —
+21% of messages contain a farewell — but 4,873 of 4,909 farewells got a
+reply ("See you soon! 😊" -> "Looking forward to it! 😊", 1,439 exact repeats
+of that line), because the vendored prompt showed 200 characters of history
+and never said a goodbye isn't answered.
+
+### utils/prompts.py — `CHAT_REPLY_PROMPT`
+
+Replaces the vendored should-respond prompt. Gives the model the last 10
+turns, the turn count, current sim time, what I'm doing, and five explicit
+"the conversation is over when…" rules (farewell received; pure
+acknowledgement with nothing new; something concrete agreed -> confirm once
+and end; same-sentiment ping-pong; I'm busy -> say so once and end). Seven
+worked examples, all lifted from the run's actual transcripts. Output gains
+an `ends_conversation` boolean next to `should_respond`/`response_content`.
+
+### internetagent.py — `do_chat` fully replaces the vendored social branch
+
+- Per-peer state (`_chat_state`, in-process): my-reply count, last tick,
+  `closed_until`. A NO, a YES with `ends_conversation`, or an unusable LLM
+  answer closes the conversation: for `CLOSED_COOLDOWN_MIN` (60 sim-min) that
+  peer's messages are recorded in the history but get **no LLM call and no
+  reply**. This is the actual loop-breaker — one side mis-answering a goodbye
+  no longer re-opens the exchange.
+- Silence > `CONVERSATION_GAP_MIN` (120 sim-min) starts a fresh conversation.
+- Hard budget `MAX_REPLIES_PER_CONVERSATION` = 8 of my replies, then
+  force-close; counted as `chat_reply_budget_hit` so `guardrails.csv` shows
+  how often the model failed to close by itself. Also counted:
+  `chat_dropped_after_close`, `chat_decision_parse_fallback`.
+- Cognition `emotion_update()` (an extra LLM call per received message,
+  vendored) now runs only for messages that actually get a reply.
+- `chat_histories[peer]` trimmed to `HISTORY_KEEP_TURNS` = 40 turns (was
+  unbounded — 17.5 kB strings by late afternoon, rewritten to memory on every
+  message).
+- Transcript printing is opt-in: `LOG_CHAT_HISTORY=1` prints each
+  conversation + decision as `$CHAT$` lines. Default is silent. The vendored
+  `Recent chat history:` INFO line (12,467 lines, most of the 61 MB run.log)
+  is gone with the override.
+- Economic messages still delegate to the vendored `do_chat`.
+
+Verified offline with fakes: open/reply, farewell -> close, cooldown drop
+without LLM call, gap reset, YES-with-close, reply budget, parse fallback,
+history cap, economic delegation. Not yet validated on a live run — the
+things to check first on the next run: `chat_reply_budget_hit` should be
+rare (if it dominates, the prompt isn't closing chats and needs work), and
+do_chat's share of tokens (`agents.csv` rows with empty agent_id) should
+stay flat instead of climbing through the day.
+
+Known, untouched: plan-driven opening messages contain literal
+"[Friend's Name]" / "[Family Member]" placeholders — that's the vendored
+MessageBlock template, a separate (cosmetic) fix.
+
+## Chat policy loosened: no caps, no cooldowns — the model decides every message (2026-10-10, later)
+
+Per direction: forcing a close or ignoring a peer isn't natural behaviour
+("sometimes something important can happen"). Removed from `do_chat`:
+`MAX_REPLIES_PER_CONVERSATION`, `CLOSED_COOLDOWN_MIN`, `CONVERSATION_GAP_MIN`,
+the per-peer `_chat_state`, and the "emotion_update only on reply" change
+(vendored per-message cognition restored). What remains: the transcript-aware
+`CHAT_REPLY_PROMPT` with its end-of-conversation rules and examples, the
+`ends_conversation` field (logged only, never enforced), the 40-turn storage
+cap, opt-in `LOG_CHAT_HISTORY=1` printing, and a per-message parse fallback
+(unusable model output = no reply *this time*; next message gets a fresh
+decision). `internet.py` gained `AGENT_COUNT` / `N_STEPS` env overrides for
+short probes; the experiment name now reflects both.
+
+### Probe: 10 agents, 60 steps (06:00-11:00), Bielik, LOG_CHAT_HISTORY=1
+
+`logs/2026-10-10_probe_10agents_5h/` (gitignored). Clean run, 2 guardrail
+firings (both vendored mobility level-1 random fallbacks).
+
+- 5 plan-driven sends -> 17 received messages: **3.4x amplification, vs 47x**
+  on the paused 100-agent run. do_chat token share **6%, vs 44-66%**.
+- 17 chat decisions: 13 replied, 4 declined. 4 farewells received, 1 of
+  them answered (and that one carried new content: "BBQ sounds amazing… See
+  you Tuesday!" -> "Bring your best grilling skills!") — vs 4,873/4,909
+  farewells answered before.
+- 2 conversations. The first closed itself at turn 8 ("See you Tuesday!"
+  -> no reply), was re-opened by the *sender's next plan step* ("Hey
+  friend! Ready for our BBQ & train talk on Tue?"), ran 6 more turns and
+  closed again at turn 14. The second was still open at the end of the
+  window. Replies are short, on-topic, not repetitive (no line repeated).
+
+Verdict: the prompt-only approach works on this sample — the model ends
+chats on its own. **Caveat: the sample is tiny** (2 conversations; the
+probe window is the quiet morning, and on the 100-agent run chat volume
+only ramped up after ~11:00). The next full run should confirm with real
+volume; the two numbers to watch are do_chat token share over the day
+(`agents.csv`, empty agent_id rows) and farewells-answered (run with
+`LOG_CHAT_HISTORY=1` and parse the `$CHAT$` blocks).
+
+Observed, untouched: the plan side re-sends near-identical "Hey friend!
+Can't wait for our hangout Tue!" openers to the same friend every time a
+"Contact with friends" plan fires, and openers still carry template
+artefacts ("[Friend's Name]", a "– Zack, the athlete/mas…" signature). That's
+the vendored MessageBlock template / plan repetition, not do_chat.
+
+## Full-day run: 100 agents, 288/288 steps, all fixes, loosened chat policy (2026-10-10 -> 2026-10-11)
+
+`logs/2026-10-10/` (gitignored), copied to
+`archive/100_agent_fullday_all_fixes_2026-10-10/` so it travels via git
+(`run.log` stays ignored). First complete 100-agent day since the 2026-05-24
+baseline: 0 LLM errors, 4.5 h wall time, 27.2M input / 3.2M output tokens,
+83 guardrail firings (47 vendored mobility level-1 random, 29 satisfaction
+eval retries, 5 website-selection fallbacks, 2 emotion-update failures).
+
+Chat-policy watch items from the probe, now at full volume:
+- 428 plan-driven sends -> 2,099 received: **4.9x amplification** (47x on
+  the paused run, 3.4x on the 10-agent probe).
+- do_chat token share by quarter of the day: 10.0 / 15.9 / 15.1 / 13.3 %
+  (was 44-66 %). Flat, not climbing.
+- `LOG_CHAT_HISTORY` was not set, so farewells-answered could not be checked.
+
+Before/after vs the 2026-05-24 baseline (`metrics/compare_runs.py`, output in
+`archive/comparison_2026-05-24_vs_2026-10-10/`, every panel pair on shared axes):
+- Trips 138 -> 1,350; agents that moved at all 28 -> 87; hours with any trip
+  12 -> 24. Median trip distance unchanged (~1.7 km).
+- 13 agents never moved all day (ids 8, 9, 17, 18, 26, 29, 30, 54, 75, 79,
+  84, 91, 96): the known simulator-level non-mover pattern from findings.md.
+- Non-chat device actions 3,341 -> 2,743; `shop` 616 -> 170 (biedronka.pl
+  was the top site before; facebook/instagram/zoom now). Work spike at 06:00
+  identical in both runs.
+- New oddity worth a look: 00:00-04:00 now has 13-22 trips/hour and 41-49
+  agents online (baseline: 0 trips, ~25 online). Night trips are "Eat
+  outside" (22), "Eat at home" (14), "Contact with friends" (14), "Grocery
+  shopping" (9). Agents are not sleeping through the night.
+
+Comparison caveat baked into the script: the baseline never logged real chat
+messages, so `compare_runs.py` drops `metadata.event = message_*` events from
+the activity plots by default (`--include-chat` keeps them) and gives chat its
+own by-hour panel instead.
+
+### Sleep-by-hour comparison added (2026-10-11)
+
+`compare_runs.py` now writes `cmp_sleep_by_hour.png`. Two definitions, because
+the May baseline has no plan logs:
+- bars (both runs): agents with a logged device action or trip in that hour
+  whose plan target is sleep-related (`task_target` / `plan_target` matching
+  sleep, nap, bed, rest, wind down). Undercounts: an agent asleep with no
+  action and no trip is invisible.
+- line (runs with `plan_logs.jsonl`): agents whose *current plan* is
+  sleep-related at any point in the hour, with plans active until the same
+  agent's next plan, day-aware across midnight.
+
+Result for the 2026-10-10 run: 20-27 of 100 agents are in a sleep plan from
+23:00 to 05:00, and 0 at 06:00-08:00 (everyone wakes). But the daytime nap
+from findings.md #3 is still there: 20-27 agents in a sleep plan from 13:00
+to 17:00, same peak height as the night. The baseline's observed-only bars
+show the same 12:00-18:00 nap hump (up to 22 agents) and almost nothing at
+night. So: fixes made night sleep happen, they did not remove the afternoon
+nap. 109 of the 113 sleep plans in the new run were driven by need="tired".

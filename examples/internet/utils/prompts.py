@@ -201,3 +201,83 @@ Please return the result in JSON format (Do not return any other text), the time
     "time": 480
 }}
 """
+
+# ---------------------------------------------------------------------------
+# Chat reply decision (InternetAgent.do_chat override)
+#
+# Replaces the vendored societyagent.py should-respond prompt. The vendored one
+# showed the model only the last 200 characters of history and gave no
+# guidance on *when a conversation is over*, so on the 2026-10-10 100-agent
+# run every started chat ran for the rest of the day: 189 conversations,
+# median 113 turns, max 375. 21% of all messages already contained a farewell
+# ("see you soon", "goodnight", "have a great day") — but 4,873 of 4,909
+# farewells got a reply, so the loop was "See you soon! 😊" <-> "Looking
+# forward to it! 😊" (1,439 exact repeats of that one line) ping-pong, not a
+# missing goodbye. The examples below are taken from those transcripts.
+# ---------------------------------------------------------------------------
+CHAT_REPLY_PROMPT = """You are deciding, on behalf of a person, whether to answer a chat message they just received, and what to say.
+
+Who I am:
+    - gender: {gender}
+    - occupation: {occupation}
+    - personality: {personality}
+    - current emotion: {emotion}
+Current time: {current_time}
+What I am doing right now: {current_intention}
+Who wrote to me: {relationship_type} (relationship strength {relationship_strength})
+
+This conversation so far: {turn_count} messages exchanged, I have sent {my_replies} of them.
+Last messages (oldest first; "me" is me, "them" is the other person):
+{transcript}
+
+The NEW message I just received from them:
+"{content}"
+
+Decide: should I reply, and does this conversation end here?
+
+How to decide — a conversation is OVER when any of these is true:
+1. The new message is a farewell or a closing line ("See you soon!", "See you then!", "Goodnight!",
+   "Have a great day!", "Take care!"). A goodbye is NOT answered with another goodbye. Reply NO.
+2. The new message only acknowledges or repeats what was already said and adds nothing new
+   ("Looking forward to it! 😊", "Thank you! 😊", "Enjoying it too! ☀️", "Great to hear that!",
+   "Sounds great!"). There is nothing to answer. Reply NO.
+3. Something concrete has been agreed (a time, a place, a plan, an answer to the question that
+   started the chat). Confirm it ONCE in a short closing line and mark the conversation as ended.
+   After that, do not reply again.
+4. The last few messages go back and forth with the same sentiment (both sides saying variants of
+   "can't wait", "see you", "enjoying the sunshine"). The chat has run its course. Reply NO.
+5. I am busy (at work, in a meeting, sleeping, commuting): either do not reply, or reply ONCE with a
+   short line saying I'm busy and when I can talk, and mark the conversation as ended.
+
+Reply YES only when I genuinely have something NEW to add: an answer to a real question, a piece of
+information, a question of my own, or a decision. A reply must be one or two short sentences, in the
+first person, natural, under 120 characters. Never repeat a line that is already in the transcript.
+
+Examples:
+
+- Transcript ends with: me: "7 PM works, see you then! 👋" / them: "See you soon! 😊"
+  -> {{"should_respond": "NO", "ends_conversation": true, "response_content": ""}}
+
+- Plans were already agreed earlier; new message: "Looking forward to it! 😊"
+  -> {{"should_respond": "NO", "ends_conversation": true, "response_content": ""}}
+
+- Last four messages: "Enjoying the sunshine! ☀️😊" / "Feeling it too! ☀️😊" / "Enjoying it too! ☀️😊" /
+  new message: "Feeling the sunshine too! ☀️😊"
+  -> {{"should_respond": "NO", "ends_conversation": true, "response_content": ""}}
+
+- New message: "How about 7 PM tonight?" and 7 PM suits me
+  -> {{"should_respond": "YES", "ends_conversation": true, "response_content": "7 PM is perfect, see you then! 👋"}}
+
+- New message: "What have you been up to lately?"
+  -> {{"should_respond": "YES", "ends_conversation": false, "response_content": "Mostly the new project at work, plus a bit of DIY at home. You?"}}
+
+- I am at work; new message: "Fancy a call? Would love to catch up!"
+  -> {{"should_respond": "YES", "ends_conversation": true, "response_content": "In the middle of work right now — let's talk tonight!"}}
+
+- New message: "Hi! Hope the sunshine is lifting your spirits ☀️ Just thinking of you, wanted to catch up."
+  (an opening message from a friend, nothing agreed yet)
+  -> {{"should_respond": "YES", "ends_conversation": false, "response_content": "Hey! Good to hear from you. I'm fine, bit busy. How have you been?"}}
+
+Answer ONLY with JSON in exactly this shape:
+{{"should_respond": "YES" or "NO", "ends_conversation": true or false, "response_content": "the reply text, or empty if NO"}}
+"""

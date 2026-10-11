@@ -3,14 +3,18 @@ import logging
 import random
 import datetime
 import math
+import os
+import re
 import traceback
+
+import json_repair
 
 from agentsociety.agent import CitizenAgentBase
 from agentsociety.cityagent import SocietyAgent
 from utils.antennas import ANTENNAS
 from utils.home_wifi import get_or_create_home_router, HOME_AT_DISTANCE
 from utils.websites import WEBSITE_DATABASE
-from utils.prompts import CUSTOM_DETAILED_PLAN_PROMPT, CUSTOM_BLOCK_DISPATCH_PROMPT
+from utils.prompts import CUSTOM_DETAILED_PLAN_PROMPT, CUSTOM_BLOCK_DISPATCH_PROMPT, CHAT_REPLY_PROMPT
 from utils.ict_devices import assign_devices_to_agent, get_device_awareness_text, ICTDevice
 from utils.device_logger import log_device_usage, log_internet_browsing, log_position_change
 from utils.needs_block_custom import TimeAwareNeedsBlock
@@ -23,6 +27,51 @@ logger = logging.getLogger(__name__)
 START_WEEKDAY = 0  # Monday
 
 _WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+# --- chat reply policy (see do_chat) -------------------------------------
+# Opt-in transcript printing: LOG_CHAT_HISTORY=1 prints every conversation
+# transcript + decision as $CHAT$ lines. Off by default — the vendored do_chat
+# logged the FULL history at INFO on every received message, which was 12k+
+# lines and most of a 61 MB run.log on the 2026-10-10 run.
+LOG_CHAT_HISTORY = os.environ.get("LOG_CHAT_HISTORY", "0") == "1"
+# No hard caps/cooldowns on purpose: every received message gets a real
+# decision from the model (utils/prompts.py's CHAT_REPLY_PROMPT). Forcing a
+# close or ignoring a peer isn't natural behaviour — something important can
+# arrive mid-chat. If the model turns out not to end conversations on its
+# own, revisit; don't re-add silent drops.
+TRANSCRIPT_TURNS = 10                # how many recent turns the model sees
+HISTORY_KEEP_TURNS = 40              # cap on the stored chat_histories string per peer
+
+# Both the vendored do_chat ("，" full-width comma) and MessageBlock (", ")
+# append to chat_histories[peer] as "<sep>me: ..." / "<sep>he/she: ...".
+_CHAT_TURN_RE = re.compile(r"(?:^|[，,]\s*)(me|he/she): ")
+
+
+def _split_chat_turns(history: str) -> list[tuple[str, str]]:
+    """'me: hi，he/she: hello' -> [('me', 'hi'), ('them', 'hello')]"""
+    if not history:
+        return []
+    marks = list(_CHAT_TURN_RE.finditer(history))
+    turns = []
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(history)
+        who = "me" if m.group(1) == "me" else "them"
+        turns.append((who, history[m.end():end].strip()))
+    return turns
+
+
+def _join_chat_turns(turns: list[tuple[str, str]]) -> str:
+    return "，".join(f"{'me' if who == 'me' else 'he/she'}: {text}" for who, text in turns)
+
+
+def _render_transcript(turns: list[tuple[str, str]], limit: int) -> str:
+    recent = turns[-limit:]
+    if not recent:
+        return "(no earlier messages — this is the first one)"
+    lines = [f"  {who}: {text}" for who, text in recent]
+    if len(turns) > limit:
+        lines.insert(0, f"  ... ({len(turns) - limit} earlier messages omitted)")
+    return "\n".join(lines)
 
 class InternetAgent(SocietyAgent):
     def __init__(self, id: int, name: str, toolbox, memory, agent_params=None, blocks=None):
@@ -658,18 +707,137 @@ Website:"""
         print(f"$DEVICE$ - {self.name} {event} (peer={peer_id}) via {device.name}")
 
     async def do_chat(self, message) -> str:
-        """Log the real network event for an incoming chat message, then defer
-        to the vendored reply-generation logic unchanged."""
+        """Replaces the vendored social-message branch of SocietyAgent.do_chat().
+
+        Why: the vendored version showed the model 200 characters of history
+        and no guidance on when a chat is over, so every plan-driven "send a
+        message to a friend" step started a reply loop that ran for the rest
+        of the simulated day (2026-10-10 run: 189 conversations, median 113
+        turns; ~190 do_chat LLM calls per step, 60-66% of all tokens by
+        mid-afternoon). See CHAT_REPLY_PROMPT in utils/prompts.py for the
+        decision rules and data-derived examples.
+
+        What changed vs. vendored:
+        - The model sees the last TRANSCRIPT_TURNS turns as a transcript, the
+          turn count, current sim time, what I'm doing, and explicit
+          end-of-conversation rules with examples. It also returns
+          `ends_conversation`, which is only logged — nothing is enforced.
+          Every received message gets its own decision; there is no reply
+          budget, cooldown or silent drop (deliberately — see module top).
+        - Stored chat_histories[peer] is trimmed to HISTORY_KEEP_TURNS.
+        - Transcript printing is opt-in via LOG_CHAT_HISTORY=1 (the vendored
+          code logged the full history at INFO on every message).
+        - Unparsable model output -> no reply this time (counted as
+          `chat_decision_parse_fallback`); next message gets a fresh decision.
+        Vendored behaviour kept: memory stream entry and cognition
+        emotion_update on every received message; economic messages delegate
+        to the vendored implementation.
+        """
         payload = getattr(message, "payload", {}) or {}
-        if payload.get("type", "social") == "social":
-            sender_id = message.from_id
-            if sender_id:
-                await self.log_message_event(
-                    event="message_received",
-                    peer_id=sender_id,
-                    action_description="Received a chat message",
-                )
-        return await super().do_chat(message)
+        if payload.get("type", "social") != "social":
+            return await super().do_chat(message)
+
+        sender_id = message.from_id
+        if not sender_id:
+            return ""
+        content = payload.get("content", "Hello, how are you?")
+        if isinstance(content, dict):
+            content = content.get("content", "Hello, how are you?")
+        content = str(content)
+
+        await self.log_message_event(
+            event="message_received",
+            peer_id=sender_id,
+            action_description="Received a chat message",
+        )
+
+        description = f"You received a social message: {content}"
+        await self.memory.stream.add(topic="social", description=description)
+        if self.params.enable_cognition:
+            try:
+                await self.cognition_block.emotion_update(description)
+            except Exception as e:
+                guardrails.bump("vendored_emotion_update_failed")
+                get_logger().warning(f"{self.name}: emotion_update on chat failed: {e!r}")
+
+        chat_histories = await self.memory.status.get("chat_histories") or {}
+        if not isinstance(chat_histories, dict):
+            chat_histories = {}
+        turns = _split_chat_turns(chat_histories.get(sender_id, ""))
+        turns.append(("them", content))
+        turns = turns[-HISTORY_KEEP_TURNS:]
+        chat_histories[sender_id] = _join_chat_turns(turns)
+        await self.memory.status.update("chat_histories", chat_histories)
+
+        relationship_strength = 0.0
+        relationship_type = "I don't know him/her"
+        for relation in await self.memory.status.get("social_network", []) or []:
+            if getattr(relation, "target_id", None) == sender_id:
+                relationship_strength = getattr(relation, "strength", 0.0)
+                relationship_type = getattr(relation, "kind", relationship_type)
+                break
+
+        current_intention = "I am doing nothing"
+        current_plan = await self.memory.status.get("current_plan")
+        if current_plan and current_plan.get("steps"):
+            step_index = current_plan.get("index", 0)
+            steps = current_plan["steps"]
+            if 0 <= step_index < len(steps):
+                current_intention = steps[step_index].get("intention", current_intention)
+
+        my_replies = sum(1 for who, _ in turns if who == "me")
+        sim_day, sim_time = self.environment.get_datetime(format_time=True)
+        prompt = CHAT_REPLY_PROMPT.format(
+            gender=await self.memory.status.get("gender", "unknown"),
+            occupation=await self.memory.status.get("occupation", "unknown"),
+            personality=await self.memory.status.get("personality", "unknown"),
+            emotion=await self.memory.status.get("emotion_types", "unknown"),
+            current_time=f"day{sim_day} {sim_time}",
+            current_intention=current_intention,
+            relationship_type=relationship_type,
+            relationship_strength=relationship_strength,
+            turn_count=len(turns),
+            my_replies=my_replies,
+            transcript=_render_transcript(turns[:-1], TRANSCRIPT_TURNS),
+            content=content,
+        )
+
+        try:
+            raw = await self.llm.atext_request(
+                dialog=[
+                    {"role": "system", "content": "You decide whether a person answers a chat message and what they say. Output JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+            )
+            parsed = json_repair.loads(raw)
+            if not isinstance(parsed, dict):
+                raise ValueError(f"not a JSON object: {raw!r}")
+        except Exception as e:
+            guardrails.bump("chat_decision_parse_fallback")
+            get_logger().warning(f"{self.name}: do_chat decision unusable ({e!r}); not replying to {sender_id} this time")
+            return ""
+
+        should_respond = str(parsed.get("should_respond", "NO")).strip().upper().startswith("Y")
+        ends = parsed.get("ends_conversation", not should_respond)
+        ends = (ends is True) or (isinstance(ends, str) and ends.strip().lower() in ("true", "yes"))
+        reply = str(parsed.get("response_content") or "").strip()
+
+        if LOG_CHAT_HISTORY:
+            print(
+                f"$CHAT$ - {self.name} <- {sender_id} (turn {len(turns)}, my replies {my_replies}, {sim_time}):\n"
+                + _render_transcript(turns, TRANSCRIPT_TURNS)
+                + f"\n  -> respond={should_respond} ends={ends} reply={reply!r}"
+            )
+
+        if not should_respond or not reply:
+            return ""
+
+        turns.append(("me", reply))
+        chat_histories[sender_id] = _join_chat_turns(turns[-HISTORY_KEEP_TURNS:])
+        await self.memory.status.update("chat_histories", chat_histories)
+        await self.send_message_to_agent(sender_id, reply)
+        return reply
 
     def _get_current_ip(self, device_id: str):
         """Return the current IP address for a device, or None if unavailable."""

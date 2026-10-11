@@ -1,0 +1,3 @@
+run,dir,agents,device_actions_excl_chat,chat_messages_sent,chat_messages_received,unique_websites,trips,agents_that_moved,agents_stationary_all_day,median_trip_distance_m,hours_with_any_trip,sleep_agent_hours_observed,sleep_plans_logged,sleep_agent_hours_from_plans,sleep_agent_hours_from_plans_09_21,steps_logged,wall_time_s_total,input_tokens_total,output_tokens_total,llm_errors_total,guardrail_firings_total
+"Before: 2026-05-24, no fixes",part1_archive/run_logs/100agent_fullday,100,3341,0,0,248,138,28,72,1763.955,12,184,,,,,,,,,
+"After: 2026-10-10, all fixes",logs/2026-10-10,100,2743,428,2099,255,1350,87,13,1638.2350000000001,24,64,113,372,177,288,16222.9,27181377,3180507,0,83

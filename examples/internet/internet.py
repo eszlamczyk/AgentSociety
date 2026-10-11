@@ -45,6 +45,9 @@ from utils.social_block_custom import SocialBlock as NetworkAwareSocialBlock
 from utils.prompts import TIME_AWARE_SLEEP_PROMPT
 from utils.social_network import seed_social_network
 
+AGENT_COUNT = int(os.environ.get("AGENT_COUNT", 100))   # override for short probes
+N_STEPS = int(os.environ.get("N_STEPS", 288))         # 288 * 5min = 24h; override for short probes
+
 config = Config(
     llm=[
         LLMConfig(
@@ -70,7 +73,7 @@ config = Config(
         citizens=[
             AgentConfig(
                 agent_class=InternetAgent,
-                number=100,
+                number=AGENT_COUNT,
                 memory_config_func=memory_config_internetagent,
                 memory_distributions=copy.deepcopy(DEFAULT_DISTRIBUTIONS),
                 blocks={
@@ -85,7 +88,7 @@ config = Config(
         ]
     ),  # type: ignore
     exp=ExpConfig(
-        name="control group - 100 agents full day",
+        name=f"control group - {AGENT_COUNT} agents, {N_STEPS} steps",
         workflow=[
             WorkflowStepConfig(
                 type=WorkflowType.STEP,
@@ -104,7 +107,6 @@ config = default(config)
 
 
 TICKS_PER_STEP = 5 * 60   # 5 minutes of sim time per step
-N_STEPS = 288             # 288 * 5min = 24hr
 
 
 async def main():
